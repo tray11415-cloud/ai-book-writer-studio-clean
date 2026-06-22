@@ -1,0 +1,4 @@
+interface:
+  display_name: "Novel Chapter Craft"
+  short_description: "Build searchable craft libraries"
+  default_prompt: "Use $novel-chapter-craft-analysis to batch-distill multiple novels or reports into an Integrated Technique Book Library and load matching techniques into the writing AGENT."
