@@ -37,6 +37,9 @@ from report_technique_distiller import DEFAULT_REPORT_DISTILL_GOAL, TECHNIQUE_LO
 from report_technique_distiller import distill_full_report_to_agent_library
 from report_technique_distiller import load_distilled_library_to_agent_fields
 from report_technique_distiller import load_latest_distilled_library_to_agent_fields
+from story_skill_studio import DEFAULT_ORCHESTRATION_GOAL, DEFAULT_SKILL_DISTILL_GOAL, SKILL_LOAD_MODES
+from story_skill_studio import distill_story_skill, orchestrate_story_prompt
+from story_skill_studio import load_latest_skill_to_agent_fields, load_orchestration_to_agent_fields
 from skill_technique_review import REVIEW_CHOICES, review_skill_and_technique
 from technique_library_builder import ALL_CATEGORY_CHOICES, BOOK_LIBRARY_LOAD_MODES
 from technique_library_builder import DEFAULT_BOOK_LIBRARY_GOAL
@@ -1927,6 +1930,56 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
         review_preview = gr.Markdown(label="Review Preview")
         review_file = gr.File(label="Review Report")
 
+    with gr.Tab("11. 故事技能 Story Skill"):
+        gr.Markdown(
+            "### 蒸餾一本小說的「寫作技能」→ 用它編排全新故事 → 直接寫\n"
+            "把參考小說蒸餾成**劇情安排與描寫技法深度綁定**的技能（每個節拍標註用了哪些描寫技法），"
+            "技能**只保留『怎麼寫』、不含原作人事物**。再用技能 + 你的全新故事種子，"
+            "編排原創劇情並產出**技法綁定的高品質提示詞**，一鍵載入寫作區開寫。"
+        )
+        skill_json_state = gr.State("")
+        skill_sys_state = gr.State("")
+        skill_tech_state = gr.State("")
+        skill_beat_state = gr.State("")
+
+        with gr.Accordion("Step 1 ｜ 蒸餾技能 Distill Skill（輸入參考小說）", open=True):
+            with gr.Row():
+                with gr.Column(scale=3):
+                    skill_ref_file = gr.File(label="Reference Novel TXT", file_count="single", file_types=[".txt"])
+                    skill_ref_text = gr.Textbox(label="或貼上參考小說正文", lines=10, placeholder="貼上一段參考小說，系統只萃取技法與結構，不會保留其人事物。")
+                    skill_ref_url = gr.Textbox(label="或章節目錄網址", placeholder="https://example.com/book/index.html")
+                    skill_distill_goal = gr.Textbox(label="/goal", value=DEFAULT_SKILL_DISTILL_GOAL, lines=4)
+                with gr.Column(scale=2):
+                    skill_output_lang = gr.Dropdown(["繁體中文", "简体中文", "English", "日本語"], value="繁體中文", label="Output Language")
+                    with gr.Row():
+                        skill_ref_limit = gr.Number(label="Reference Chapter Limit", value=5, precision=0)
+                        skill_max_ref_chars = gr.Number(label="Max Reference Chars", value=12000, precision=0)
+                    skill_dry_run = gr.Checkbox(label="Dry Run / 離線檢查", value=True)
+            skill_distill_btn = gr.Button("① 蒸餾寫作技能", variant="primary")
+            skill_distill_status = gr.Textbox(label="Distill Status", lines=5, interactive=False)
+            skill_preview = gr.Markdown(label="Skill Preview")
+            skill_file_out = gr.File(label="story_skill.json")
+
+        with gr.Accordion("Step 2 ｜ 編排劇情 + 產生提示詞 Orchestrate（全新原創故事）", open=True):
+            skill_orch_skill_file = gr.File(label="（可選）載入已保存的 story_skill.json", file_count="single", file_types=[".json"])
+            skill_premise = gr.Textbox(label="全新故事種子 / 設定（不要沿用來源故事）", lines=6, placeholder="全新的主角、世界、核心衝突與你想要的方向...")
+            with gr.Row():
+                skill_genre_tone = gr.Textbox(label="Genre / Tone", placeholder="仙俠、宮廷、懸疑、黑暗浪漫...")
+                skill_target_chapters = gr.Number(label="Target Chapters", value=12, precision=0)
+            skill_orch_goal = gr.Textbox(label="/goal", value=DEFAULT_ORCHESTRATION_GOAL, lines=3)
+            skill_orch_dry_run = gr.Checkbox(label="Dry Run / 離線檢查", value=True)
+            skill_orchestrate_btn = gr.Button("② 編排劇情並產生技法綁定提示詞", variant="primary")
+            skill_orch_status = gr.Textbox(label="Orchestration Status", lines=5, interactive=False)
+            skill_orch_preview = gr.Markdown(label="Prompt + Beat Plan Preview")
+            skill_orch_file = gr.File(label="orchestration.md")
+
+        with gr.Accordion("Step 3 ｜ 載入寫作區 Load Into Interactive Writing", open=True):
+            skill_load_mode = gr.Dropdown(SKILL_LOAD_MODES, value=SKILL_LOAD_MODES[0], label="Load Mode")
+            with gr.Row():
+                skill_load_btn = gr.Button("③ 載入到寫作區（提示詞 + 技法 + 節拍）", variant="primary")
+                skill_load_latest_btn = gr.Button("載入最近一次編排", variant="secondary")
+            skill_load_status = gr.Textbox(label="Load Status", lines=3, interactive=False)
+
     with gr.Tab("10. 說明書 Manual"):
         gr.Markdown(
             "### 使用說明書 — 逐面板說明、深度分析原理與操作流程\n\n"
@@ -2303,6 +2356,78 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
             report_load_mode,
         ],
         outputs=[technique_library_input, memory_input, instruction, report_agent_load_status],
+        api_name=False,
+    )
+
+    skill_distill_btn.click(
+        distill_story_skill,
+        inputs=[
+            skill_ref_file,
+            skill_ref_text,
+            skill_ref_url,
+            skill_distill_goal,
+            skill_output_lang,
+            skill_ref_limit,
+            skill_max_ref_chars,
+            skill_dry_run,
+            analysis_api_key_input,
+            analysis_base_url_input,
+            analysis_model_input,
+        ],
+        outputs=[skill_distill_status, skill_preview, skill_file_out, skill_json_state],
+        api_name=False,
+    )
+
+    skill_orchestrate_btn.click(
+        orchestrate_story_prompt,
+        inputs=[
+            skill_json_state,
+            skill_orch_skill_file,
+            skill_premise,
+            skill_genre_tone,
+            skill_target_chapters,
+            skill_orch_goal,
+            skill_output_lang,
+            skill_orch_dry_run,
+            analysis_api_key_input,
+            analysis_base_url_input,
+            analysis_model_input,
+        ],
+        outputs=[
+            skill_orch_status,
+            skill_orch_preview,
+            skill_orch_file,
+            skill_sys_state,
+            skill_tech_state,
+            skill_beat_state,
+        ],
+        api_name=False,
+    )
+
+    skill_load_btn.click(
+        load_orchestration_to_agent_fields,
+        inputs=[
+            skill_sys_state,
+            skill_tech_state,
+            skill_beat_state,
+            system_prompt_input,
+            technique_library_input,
+            memory_input,
+            skill_load_mode,
+        ],
+        outputs=[system_prompt_input, technique_library_input, memory_input, skill_load_status],
+        api_name=False,
+    )
+
+    skill_load_latest_btn.click(
+        load_latest_skill_to_agent_fields,
+        inputs=[
+            system_prompt_input,
+            technique_library_input,
+            memory_input,
+            skill_load_mode,
+        ],
+        outputs=[system_prompt_input, technique_library_input, memory_input, skill_load_status],
         api_name=False,
     )
 

@@ -20,7 +20,7 @@ anti-repetition guard and long-form memory (see
 
 ## Features
 
-- Single Gradio studio organized as a guided writing pipeline (10 tabs).
+- Single Gradio studio organized as a guided writing pipeline (11 tabs).
 - Model routing across NALANG (writing), Grok/xAI (analysis), and a local LoRA.
 - Interactive scene-by-scene writing and rewrite / style transfer.
 - Per-chapter "chapter craft" analysis producing a deep `full_report.md`.
@@ -111,6 +111,7 @@ The studio is organized as a single top-to-bottom pipeline. The tab order **is**
 8. `8. 存讀檔 Save / Load`.
 9. `9. 技法回灌與檢閱 Skill / Technique Review` — distill `full_report.md` into a compact `Technique Library`, and review the latest deep outputs locally.
 10. `10. 說明書 Manual` — the full panel guide rendered in-app.
+11. `11. 故事技能 Story Skill` — distill an input novel into a reusable, **plot-bound** writing skill, orchestrate an original technique-bound prompt from it, and load it straight into Interactive Writing (see [Story Skill](#story-skill-distill--orchestrate--write)).
 
 ## Model routing
 
@@ -164,6 +165,49 @@ All are optional; defaults are shown. Set `BOOK_WRITER_REPETITION_GUARD=0`
 Some baseline overlap is normal (names, function words), so judge a threshold
 change against a baseline run rather than against the absolute number. Lowering
 the threshold or raising the retry count makes generations stricter but slower.
+
+## Story Skill (distill → orchestrate → write)
+
+Tab `11. 故事技能 Story Skill` (module `story_skill_studio.py`) turns an input
+novel into a reusable **writing skill** that *deeply binds plot arrangement to
+description technique*, then writes an original story with it. The skill carries
+the source's **craft, never its content** — no source characters, places,
+objects, or concrete events — so the output is a fresh, original story, not a
+continuation of or a remix of the source's 人事物.
+
+Three stages, each with a Dry-Run mode for offline checking:
+
+1. **Distill** (`distill_story_skill`) — feed a reference novel (TXT / pasted
+   text / chapter-directory URL). The analysis model (Grok) returns a structured
+   skill JSON:
+   - `narrative_method` — POV, tense, narration distance, voice, dialogue style.
+   - `description_techniques[]` — technique cards (when-to-use, how, sentence
+     rhythm, sensory layering, word palette, weak-vs-strong).
+   - `plot_arrangement` — engine, pacing curve, escalation, hook, arc shape
+     (abstract patterns only).
+   - `beat_template[]` — the **binding**: each beat names its `function`,
+     `pacing`, `emotional_target`, and the `bound_technique_ids` (which
+     description techniques to apply at that beat) plus how to apply them.
+   The skill is saved to `book_output/story_skills/<timestamp>/story_skill.json`.
+
+2. **Orchestrate** (`orchestrate_story_prompt`) — skill-driven Plot Ideation.
+   Give it a **new** story seed; it invents an original plot (all-new people /
+   places / events) following the skill's beat template, and composes a
+   high-quality, beat-by-beat **technique-bound writing prompt** where every
+   chapter says which techniques to apply. Saved under
+   `book_output/story_skills/orchestrations/<timestamp>/`.
+
+3. **Write** — one click (`Load Into Interactive Writing`) pushes the
+   orchestrated prompt into **System Prompt Override**, the technique cards into
+   **Technique Library**, and the beat plan into **Story Memory**. Switch to
+   `3. 寫作 Interactive Writing` and generate — the writing model now follows the
+   source's narrative method and applies its techniques at the right beats, with
+   entirely original content. Generation still runs through the
+   [repetition guard](#cross-response-repetition-guard).
+
+The abstraction barrier (extract patterns, drop entities; original content only)
+is what separates this from `4. 改寫 Rewrite / Style Transfer`, which transforms
+an existing passage in place.
 
 ## Deeper craft analysis
 
