@@ -41,7 +41,7 @@ from story_skill_studio import DEFAULT_ORCHESTRATION_GOAL, DEFAULT_SKILL_DISTILL
 from story_skill_studio import distill_story_skill, orchestrate_story_prompt
 from story_skill_studio import load_latest_skill_to_agent_fields, load_orchestration_to_agent_fields
 from story_skill_studio import load_skill_techniques_to_agent_fields
-from story_skill_studio import read_continuation_source
+from story_skill_studio import read_continuation_source, generate_continuation_prompt
 from project_saves import delete_project_slot, load_project_slot, refresh_slots, save_project_slot
 from skill_technique_review import REVIEW_CHOICES, review_skill_and_technique
 from technique_library_builder import ALL_CATEGORY_CHOICES, BOOK_LIBRARY_LOAD_MODES
@@ -2005,25 +2005,43 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
                 skill_load_latest_btn = gr.Button("載入最近一次編排", variant="secondary")
             skill_load_status = gr.Textbox(label="Load Status", lines=3, interactive=False)
 
-        with gr.Accordion("續寫模式 ｜ 附上要續寫的小說 Continue an Existing Novel", open=False):
-            gr.Markdown(
-                "要**接著寫你自己的小說**?在這裡附上它,系統會讀出**續寫所需資訊**(人物、世界、劇情進度、"
-                "停在哪、未解線索),連同正文一起載入寫作區。**這份來源會保留其真實人事物**(與上面的技法蒸餾不同),"
-                "因為這是你要延續的故事。配合『①b 直接載入技法』,就能用蒸餾出的技法續寫自己的小說。"
-            )
+    with gr.Tab("12. 續寫 Continuation"):
+        gr.Markdown(
+            "### 用蒸餾出的技能,續寫你自己的小說\n"
+            "三步:**① 技能來源**(用『11. 故事技能』蒸餾出的,或上傳 `story_skill.json`)→ "
+            "**② 載入要續寫的小說**(讀出人物/世界/劇情進度/接續點,**保留真實人事物**)→ "
+            "**③ 產出續寫 PROMPT**(綜合技法綁定＋續寫劇情編排＋避免重複,一鍵灌進寫作區)。"
+        )
+        cont_brief_state = gr.State("")
+
+        with gr.Accordion("① 技能來源 Skill Source（可選）", open=True):
+            gr.Markdown("預設使用『11. 故事技能』Step 1 蒸餾出的技能(自動沿用)。也可在此上傳已保存的 `story_skill.json`。不提供技能也能續寫(僅少了技法鎖定)。")
+            cont_skill_file = gr.File(label="（可選）上傳 story_skill.json", file_count="single", file_types=[".json"])
+
+        with gr.Accordion("② 載入要續寫的小說 Load The Novel To Continue", open=True):
             with gr.Row():
                 with gr.Column(scale=3):
-                    continue_novel_file = gr.File(label="要續寫的小說 TXT", file_count="single", file_types=[".txt"])
-                    continue_novel_text = gr.Textbox(label="或貼上要續寫的正文", lines=10, placeholder="貼上你目前寫到的小說正文（含前文越多，續寫越連貫）。")
-                    continue_novel_url = gr.Textbox(label="或章節目錄網址", placeholder="https://example.com/book/index.html")
+                    cont_novel_file = gr.File(label="要續寫的小說 TXT", file_count="single", file_types=[".txt"])
+                    cont_novel_text = gr.Textbox(label="或貼上要續寫的正文", lines=10, placeholder="貼上你目前寫到的小說正文（前文越多，續寫越連貫）。")
+                    cont_novel_url = gr.Textbox(label="或章節目錄網址", placeholder="https://example.com/book/index.html")
                 with gr.Column(scale=2):
-                    continue_extract_brief = gr.Checkbox(label="用 Grok 擷取人物/世界/劇情摘要（取消＝只載入正文）", value=True)
-                    continue_max_chars = gr.Number(label="載入正文上限字數（0＝全部，僅保留最近段落）", value=0, precision=0)
-            continue_btn = gr.Button("讀取續寫資訊並載入寫作區", variant="primary")
-            continue_status = gr.Textbox(label="Continuation Status", lines=4, interactive=False)
-            continue_preview = gr.Markdown(label="Continuation Preview")
+                    cont_output_lang = gr.Dropdown(["繁體中文", "简体中文", "English", "日本語"], value="繁體中文", label="Output Language")
+                    cont_extract_brief = gr.Checkbox(label="用 Grok 擷取人物/世界/劇情摘要（取消＝只載入正文）", value=True)
+                    cont_max_chars = gr.Number(label="載入正文上限字數（0＝全部，僅保留最近段落）", value=0, precision=0)
+            cont_load_btn = gr.Button("② 讀取續寫資訊並載入寫作區", variant="primary")
+            cont_status = gr.Textbox(label="Load Status", lines=4, interactive=False)
+            cont_preview = gr.Markdown(label="Continuation Context Preview")
 
-    with gr.Tab("10. 說明書 Manual"):
+        with gr.Accordion("③ 產出續寫 PROMPT Generate Continuation Prompt", open=True):
+            cont_direction = gr.Textbox(label="續寫方向（可選）", lines=3, placeholder="你想要接下來往哪走？不填＝依未解線索與情境自然推進。")
+            with gr.Row():
+                cont_next_chapters = gr.Number(label="規劃接下來幾拍/章", value=5, precision=0)
+                cont_prompt_dry_run = gr.Checkbox(label="Dry Run / 離線檢查", value=True)
+            cont_prompt_btn = gr.Button("③ 產出續寫 PROMPT 並載入寫作區", variant="primary")
+            cont_prompt_status = gr.Textbox(label="Prompt Status", lines=4, interactive=False)
+            cont_prompt_preview = gr.Markdown(label="Continuation Prompt Preview")
+
+    with gr.Tab("13. 說明書 Manual"):
         gr.Markdown(
             "### 使用說明書 — 逐面板說明、深度分析原理與操作流程\n\n"
             "下面是完整說明書（與專案根目錄的 "
@@ -2490,15 +2508,15 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
         api_name=False,
     )
 
-    continue_btn.click(
+    cont_load_btn.click(
         read_continuation_source,
         inputs=[
-            continue_novel_file,
-            continue_novel_text,
-            continue_novel_url,
-            continue_max_chars,
-            skill_output_lang,
-            continue_extract_brief,
+            cont_novel_file,
+            cont_novel_text,
+            cont_novel_url,
+            cont_max_chars,
+            cont_output_lang,
+            cont_extract_brief,
             analysis_api_key_input,
             analysis_base_url_input,
             analysis_model_input,
@@ -2507,13 +2525,40 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
             memory_input,
         ],
         outputs=[
-            continue_status,
-            continue_preview,
+            cont_status,
+            cont_preview,
             full_story_box,
             background_input,
             roles_input,
             memory_input,
             instruction,
+            cont_brief_state,
+        ],
+        api_name=False,
+    )
+
+    cont_prompt_btn.click(
+        generate_continuation_prompt,
+        inputs=[
+            skill_json_state,
+            cont_skill_file,
+            full_story_box,
+            cont_brief_state,
+            cont_direction,
+            cont_next_chapters,
+            cont_output_lang,
+            cont_prompt_dry_run,
+            analysis_api_key_input,
+            analysis_base_url_input,
+            analysis_model_input,
+        ],
+        outputs=[
+            cont_prompt_status,
+            cont_prompt_preview,
+            system_prompt_input,
+            technique_library_input,
+            instruction,
+            avoid_words_input,
         ],
         api_name=False,
     )

@@ -28,6 +28,7 @@ from typing import Any
 
 from openai import OpenAI
 
+import repetition_guard as rg
 from chapter_craft_skill import (
     API_TIMEOUT,
     Chapter,
@@ -493,25 +494,27 @@ def read_continuation_source(
     current_background: str,
     current_roles: Any,
     current_memory: str,
-) -> tuple[str, str, str, str, Any, str, str]:
+) -> tuple[str, str, str, str, Any, str, str, str]:
     """Read a to-be-continued novel and load continuation context into the writing area.
 
-    Returns (status, preview_md, full_story, background, roles, memory, instruction):
-    full_story = the prose to continue from; background/roles = extracted (or kept);
-    memory = current memory + a continuation brief; instruction = a continue directive.
+    Returns (status, preview_md, full_story, background, roles, memory, instruction,
+    brief_block): full_story = the prose to continue from; background/roles =
+    extracted (or kept); memory = current memory + a continuation brief;
+    instruction = a continue directive; brief_block = the continuation brief text
+    (stashed for the continuation-prompt step).
     """
     empty_roles = current_roles if isinstance(current_roles, list) and current_roles else [["", "", ""]]
     try:
         if not (novel_file or (novel_text or "").strip() or (novel_url or "").strip()):
             return ("[ERROR] 請附上要續寫的小說（上傳 TXT / 貼上正文 / 章節目錄網址）。", "",
-                    "", current_background or "", empty_roles, current_memory or "", "")
+                    "", current_background or "", empty_roles, current_memory or "", "", "")
         chapters, source_label = load_chapters(
             txt_file=novel_file, pasted_text=novel_text, directory_url=novel_url,
             limit=None, fallback_chunk_chars=200000,
         )
         full_story = "\n\n".join(ch.text for ch in chapters).strip()
         if not full_story:
-            return ("[ERROR] 未能從來源讀到正文。", "", "", current_background or "", empty_roles, current_memory or "", "")
+            return ("[ERROR] 未能從來源讀到正文。", "", "", current_background or "", empty_roles, current_memory or "", "", "")
         cap = to_positive_int(max_story_chars) or 0
         if cap and len(full_story) > cap:
             # Keep the most recent part — that is what continuation writes from.
@@ -547,12 +550,12 @@ def read_continuation_source(
         )
         status = (
             "[OK] 已讀取續寫所需資訊並載入寫作區（Full Story ＋ 背景／角色 ＋ 續寫摘要 ＋ 接續指令）。\n"
-            "→ 可先在本面板按『①b 直接載入技法』套上寫作技能，再切到『3. 寫作』直接續寫。"
+            "→ 接著到 Step 3 產生續寫 PROMPT（會套上技能技法並避免重複），再切到『3. 寫作』續寫。"
         )
-        return status, trim_preview(preview), full_story, background, roles, memory, instruction
+        return status, trim_preview(preview), full_story, background, roles, memory, instruction, brief_block
     except Exception as exc:  # noqa: BLE001
         logger.exception("read_continuation_source failed")
-        return f"[ERROR] {exc}", "", "", current_background or "", empty_roles, current_memory or "", ""
+        return f"[ERROR] {exc}", "", "", current_background or "", empty_roles, current_memory or "", "", ""
 
 
 def _extract_continuation_brief(route: ModelRoute, chapters: list[Chapter], output_language: str) -> dict[str, Any]:
@@ -603,6 +606,162 @@ def _render_continuation_brief(brief: dict[str, Any]) -> list[str]:
     if (brief.get("tone") or "").strip():
         lines.append("語氣基調：" + brief["tone"].strip())
     return lines
+
+
+def generate_continuation_prompt(
+    skill_json_str: str,
+    skill_file: Any,
+    full_story: str,
+    brief_text: str,
+    direction: str,
+    next_chapters: float | int | None,
+    output_language: str,
+    dry_run: bool,
+    analysis_api_key: str,
+    analysis_base_url: str,
+    analysis_model_name: str,
+) -> tuple[str, str, str, str, str, str]:
+    """Produce a continuation PROMPT that reuses every prior mechanism:
+    the distilled skill (narrative method + technique binding), continuation-aware
+    plot orchestration (plan the NEXT beats of the EXISTING story), and the
+    repetition guard (mine already-written phrasings into an avoid-list).
+
+    Returns (status, preview, system_prompt, technique_library, instruction, avoid_words)
+    — the last four are loaded straight into the writing area.
+    """
+    try:
+        story = (full_story or "").strip()
+        if not story:
+            return ("[ERROR] 沒有可續寫的正文，請先在 Step 2 載入要續寫的小說。", "", "", "", "", "")
+
+        # Skill is optional — continuation still works (just without locked craft).
+        skill: dict[str, Any] = {}
+        if (skill_json_str or "").strip() or skill_file:
+            try:
+                skill = _load_skill_payload(skill_json_str, skill_file)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("continuation: skill load failed, proceeding without it: %s", exc)
+                skill = {}
+
+        n = to_positive_int(next_chapters) or 5
+        cjk = output_language != "English"
+
+        # 防止重複：mine the phrasings already used in the existing prose.
+        overused = rg.extract_overused_phrases(story) if rg.GUARD_ENABLED else []
+        avoid_directive = rg.build_avoid_directive(overused, cjk=cjk) if overused else ""
+        avoid_words = "、".join(overused[:12]) if cjk else ", ".join(overused[:12])
+
+        if dry_run:
+            plan = _dry_run_continuation_plan(skill, brief_text, direction, n)
+        else:
+            route = _make_route("Analysis / Grok", analysis_api_key, analysis_base_url, analysis_model_name)
+            plan = _orchestrate_continuation(
+                route=route, skill=skill, story=story, brief_text=brief_text,
+                direction=direction, n=n, output_language=output_language, overused=overused,
+            )
+
+        has_skill = bool(skill.get("narrative_method") or skill.get("description_techniques"))
+        system_prompt = (
+            render_skill_system_prompt(skill, continuation=True)
+            if has_skill
+            else "（未載入技能；依續寫上下文、續寫規劃與『避免重複』指令續寫即可。）"
+        )
+        technique_library = render_technique_library(skill)
+        instruction_parts = ["【續寫規劃（接續既有故事，勿重啟、勿重述已寫內容）】\n" + plan]
+        if avoid_directive:
+            instruction_parts.append(avoid_directive)
+        instruction = "\n\n".join(instruction_parts)
+
+        output_dir = Path.cwd() / "book_output" / "continuations" / datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        write_text_with_backup(output_dir / "continuation_prompt.md", instruction)
+        if has_skill:
+            write_text_with_backup(output_dir / "locked_narrative.md", system_prompt)
+
+        preview = (
+            "# 續寫 PROMPT（已載入 Story Instruction）\n\n" + instruction
+            + ("\n\n---\n# 鎖定敘事方式（System Prompt）\n\n" + system_prompt if has_skill else "")
+        )
+        status = (
+            "[OK] 已產生續寫 PROMPT 並載入寫作區："
+            f"{'敘事方式＋技法庫＋' if has_skill else ''}續寫指令＋避免重複詞（{len(overused)} 條）。\n"
+            f"規劃接下來 {n} 個節拍。{'（Dry Run 範例）' if dry_run else ''}\n"
+            "→ 切到『3. 寫作』直接續寫；寫作時仍會自動走重複守衛。"
+        )
+        return status, trim_preview(preview), system_prompt, technique_library, instruction, avoid_words
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("generate_continuation_prompt failed")
+        return f"[ERROR] {exc}", "", "", "", "", ""
+
+
+def _orchestrate_continuation(
+    *,
+    route: ModelRoute,
+    skill: dict[str, Any],
+    story: str,
+    brief_text: str,
+    direction: str,
+    n: int,
+    output_language: str,
+    overused: list[str],
+) -> str:
+    if route.client is None:
+        raise RuntimeError("缺少 Analysis LLM client。")
+    recent_tail = story[-3000:]
+    skill_compact = json.dumps(_skill_for_prompt(skill), ensure_ascii=False) if skill else "（未提供技能）"
+    avoid_block = "、".join(overused[:20]) if overused else "（無）"
+    return chat_complete(
+        route.client,
+        label="續寫劇情編排",
+        model=route.model_name,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "你是小說『續寫劇情編排總監 + 提示詞工程師』。你要規劃一個既有故事『接下來』的劇情,"
+                    "並產出一段可直接交給寫作 AI 的續寫提示詞。鐵則：\n"
+                    "1) 這是『續寫』——必須延續既有人物、世界、語氣與未解線索,不可重啟故事、不可另開平行劇情、"
+                    "不可重述或改寫已發生的內容。\n"
+                    "2) 若提供了寫作技能,鎖定其敘事方式,並在每個節拍標註要套用的描寫技法（引用技法名稱）。\n"
+                    "3) 主動避免重複既有措辞（下方會給出已被用滥的詞句清單）。"
+                    f"{language_instruction(output_language)}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"請規劃接下來 {n} 個章節／節拍的續寫提示詞。\n\n"
+                    f"【續寫方向（使用者意願，可選）】\n{(direction or '未指定，請依未解線索與情境自然推進').strip()}\n\n"
+                    f"【故事續寫資訊（摘要）】\n{brief_text or '（無摘要，請依最近正文判讀）'}\n\n"
+                    f"【最近正文（接續點，務必銜接）】\n{recent_tail}\n\n"
+                    f"【寫作技能 JSON（敘事方式＋技法＋節拍模板）】\n{skill_compact}\n\n"
+                    f"【避免重複的既有措辞】\n{avoid_block}\n\n"
+                    "請輸出固定格式：\n"
+                    f"## 續寫總方向（1-2 句，承接目前情境）\n"
+                    f"## 接下來 {n} 拍：每拍＝節拍功能｜要發生的事（延續既有人物與線索）｜情緒落點｜要套用的描寫技法（引用技能技法名稱）｜與前文的銜接點\n"
+                    "## 本次續寫要推進/收束的未解線索\n"
+                    "## 給寫作 AI 的最終 Director 指令（一段可貼上即用，明確要求：延續而非重啟、逐拍套用技法、避免重複上面列出的措辞）"
+                ),
+            },
+        ],
+        temperature=0.6,
+        max_tokens=4000,
+    )
+
+
+def _dry_run_continuation_plan(skill: dict[str, Any], brief_text: str, direction: str, n: int) -> str:
+    techs = "、".join(t.get("name", "") for t in (skill.get("description_techniques") or [])[:3]) or "（未載入技能技法）"
+    return (
+        "## 續寫總方向\n"
+        f"（離線範例）承接目前情境，依未解線索推進；方向：{(direction or '自然推進').strip()}。\n\n"
+        f"## 接下來 {n} 拍\n"
+        + "\n".join(
+            f"- 第 {i} 拍：推進一條未解線索｜延續既有人物關係｜情緒升一級｜套用技法：{techs}｜緊接前一場景結尾"
+            for i in range(1, n + 1)
+        )
+        + "\n\n## 給寫作 AI 的最終 Director 指令\n"
+        "延續既有故事與語氣，逐拍套用上述描寫技法，不重啟、不重述已寫內容，並避免重複既有措辞。"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -791,9 +950,14 @@ def render_skill_markdown(skill: dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def render_skill_system_prompt(skill: dict[str, Any]) -> str:
+def render_skill_system_prompt(skill: dict[str, Any], *, continuation: bool = False) -> str:
     """A craft-only System Prompt: lock the narrative method + rules, leave plot to
-    the user. The concrete beat->technique mapping rides in Story Memory."""
+    the user. The concrete beat->technique mapping rides in Story Memory.
+
+    continuation=False (original-creation): demand entirely new entities.
+    continuation=True: keep the existing story's entities (we are extending it),
+    only the narrative method + techniques are locked.
+    """
     nm = skill.get("narrative_method", {})
     rules = skill.get("transferable_rules") or []
     parts = ["【寫作技能·鎖定敘事方式與描寫技法（劇情由你在 Story Instruction 自行主導）】"]
@@ -803,10 +967,16 @@ def render_skill_system_prompt(skill: dict[str, Any]) -> str:
     if rules:
         parts.append("寫作守則：")
         parts += [f"- {r}" for r in rules]
-    parts.append(
-        "請依使用者給的情節推進；當前情節走到哪一種節拍，就套用 Technique Library 與 "
-        "Story Memory 裡對應的描寫技法。全程使用全新原創人事物，不得出現任何來源故事的人名、地名、物件或情節。"
-    )
+    if continuation:
+        parts.append(
+            "本次為『續寫』：延續既有故事的人物、世界與設定（見 World/Background、Characters、Story Memory），"
+            "自然接續、不要重啟故事或重述已寫內容；只鎖定上述敘事方式，並在對應節拍套用 Technique Library 的描寫技法。"
+        )
+    else:
+        parts.append(
+            "請依使用者給的情節推進；當前情節走到哪一種節拍，就套用 Technique Library 與 "
+            "Story Memory 裡對應的描寫技法。全程使用全新原創人事物，不得出現任何來源故事的人名、地名、物件或情節。"
+        )
     return "\n".join(parts).strip()
 
 

@@ -110,8 +110,9 @@ The studio is organized as a single top-to-bottom pipeline. The tab order **is**
 7. `7. 深度技法書庫 Deep Technique Book` — build a searchable hierarchy such as `容顏描寫 / 眼睛描寫`, `身材描寫 / 手與指節描寫`, `動作描寫 / 喝酒飲茶描寫` from the Reference Library, then load matched techniques into the writing AGENT.
 8. `8. 存讀檔 Save / Load` — **named multi-slot saves**: bundle the story bible, memory, technique library, prompts, **and the distilled Story Skill** into a named slot; keep many, load/delete any from a dropdown (see [Named save slots](#named-save-slots)). Single-file JSON export/import remains under an accordion.
 9. `9. 技法回灌與檢閱 Skill / Technique Review` — distill `full_report.md` into a compact `Technique Library`, and review the latest deep outputs locally.
-10. `10. 說明書 Manual` — the full panel guide rendered in-app.
 11. `11. 故事技能 Story Skill` — distill an input novel into a reusable, **plot-bound** writing skill, orchestrate an original technique-bound prompt from it, and load it straight into Interactive Writing (see [Story Skill](#story-skill-distill--orchestrate--write)).
+12. `12. 續寫 Continuation` — continue *your own* novel: pick a distilled skill, load the to-be-continued novel (reads its real characters/world/plot/where-it-left-off), and generate a continuation prompt that reuses the skill's technique binding, continuation-aware plot orchestration, and the repetition guard (see [Continuation tab](#continuation-tab)).
+13. `13. 說明書 Manual` — the full panel guide rendered in-app.
 
 ## Model routing
 
@@ -242,25 +243,34 @@ The abstraction barrier (extract patterns, drop entities; original content only)
 is what separates this from `4. 改寫 Rewrite / Style Transfer`, which transforms
 an existing passage in place.
 
-### Continuation mode — continue your own novel with the skill
+## Continuation tab
 
-The Story Skill tab also has a **續寫模式 ｜ Continue an Existing Novel** section
-(`read_continuation_source`). Attach the novel you actually want to **continue**
-(TXT / pasted text / chapter-directory URL) and it reads the *continuation
-context* — and, **unlike distillation, it keeps the source's real entities**,
-because this is your own story to extend, not an abstract craft reference:
+Tab `12. 續寫 Continuation` is the **one place** for continuing an existing
+novel. It deliberately reuses, rather than duplicates, the other mechanisms — a
+distilled skill, continuation-aware plot orchestration, and the repetition guard
+— in a clean three-step flow:
 
-- The prose is loaded into **Full Story** (optionally capped to the most recent
-  N characters — the part continuation writes from).
-- With **extract brief** on, the analysis model pulls a structured brief —
-  `background`, characters (→ the character table), plot-so-far, the current
-  situation / where it left off, open threads, and tone — into **World /
-  Background**, **Characters**, and an appended **Story Memory** block.
-- A continue-from-here directive is placed in **Story Instruction**.
-
-Combine the two halves of the tab: load a distilled skill's craft with
-`①b 直接載入技法` (the *how*) **and** read a continuation source (the *what*),
-then go to `3. 寫作` to continue your own novel in the distilled style.
+1. **Skill source** — use the skill distilled in `11. 故事技能` (shared
+   automatically), or upload a `story_skill.json`. A skill is optional;
+   continuation still works without one (you just lose the locked craft).
+2. **Load the novel to continue** (`read_continuation_source`) — attach the novel
+   (TXT / paste / URL). **Unlike distillation, this keeps the source's real
+   entities**, because it is your own story to extend: the prose goes into
+   **Full Story** (optionally capped to the most recent N chars), and an optional
+   Grok brief pulls `background`, characters (→ table), plot-so-far, current
+   situation / where it left off, open threads, and tone into **World /
+   Background**, **Characters**, and an appended **Story Memory** block.
+3. **Generate the continuation prompt** (`generate_continuation_prompt`) — one
+   click composes a prompt that (a) plans the **next** beats of the *existing*
+   story (continuation-aware orchestration — no restart, no parallel story), (b)
+   binds each next beat to the skill's **description techniques**, and (c) mines
+   the already-written prose with `repetition_guard` to build an **avoid-list of
+   reused phrasings**. It loads the locked narrative method into **System Prompt
+   Override**, the techniques into **Technique Library**, the beat plan +
+   anti-repetition directive into **Story Instruction**, and the overused
+   phrasings into **Avoid Words** — then you go to `3. 寫作` and continue. The
+   writing step still runs through the [repetition guard](#cross-response-repetition-guard)
+   on every turn.
 
 ## Deeper craft analysis
 
