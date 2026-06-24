@@ -41,6 +41,7 @@ from story_skill_studio import DEFAULT_ORCHESTRATION_GOAL, DEFAULT_SKILL_DISTILL
 from story_skill_studio import distill_story_skill, orchestrate_story_prompt
 from story_skill_studio import load_latest_skill_to_agent_fields, load_orchestration_to_agent_fields
 from story_skill_studio import load_skill_techniques_to_agent_fields
+from story_skill_studio import read_continuation_source
 from project_saves import delete_project_slot, load_project_slot, refresh_slots, save_project_slot
 from skill_technique_review import REVIEW_CHOICES, review_skill_and_technique
 from technique_library_builder import ALL_CATEGORY_CHOICES, BOOK_LIBRARY_LOAD_MODES
@@ -2004,6 +2005,24 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
                 skill_load_latest_btn = gr.Button("載入最近一次編排", variant="secondary")
             skill_load_status = gr.Textbox(label="Load Status", lines=3, interactive=False)
 
+        with gr.Accordion("續寫模式 ｜ 附上要續寫的小說 Continue an Existing Novel", open=False):
+            gr.Markdown(
+                "要**接著寫你自己的小說**?在這裡附上它,系統會讀出**續寫所需資訊**(人物、世界、劇情進度、"
+                "停在哪、未解線索),連同正文一起載入寫作區。**這份來源會保留其真實人事物**(與上面的技法蒸餾不同),"
+                "因為這是你要延續的故事。配合『①b 直接載入技法』,就能用蒸餾出的技法續寫自己的小說。"
+            )
+            with gr.Row():
+                with gr.Column(scale=3):
+                    continue_novel_file = gr.File(label="要續寫的小說 TXT", file_count="single", file_types=[".txt"])
+                    continue_novel_text = gr.Textbox(label="或貼上要續寫的正文", lines=10, placeholder="貼上你目前寫到的小說正文（含前文越多，續寫越連貫）。")
+                    continue_novel_url = gr.Textbox(label="或章節目錄網址", placeholder="https://example.com/book/index.html")
+                with gr.Column(scale=2):
+                    continue_extract_brief = gr.Checkbox(label="用 Grok 擷取人物/世界/劇情摘要（取消＝只載入正文）", value=True)
+                    continue_max_chars = gr.Number(label="載入正文上限字數（0＝全部，僅保留最近段落）", value=0, precision=0)
+            continue_btn = gr.Button("讀取續寫資訊並載入寫作區", variant="primary")
+            continue_status = gr.Textbox(label="Continuation Status", lines=4, interactive=False)
+            continue_preview = gr.Markdown(label="Continuation Preview")
+
     with gr.Tab("10. 說明書 Manual"):
         gr.Markdown(
             "### 使用說明書 — 逐面板說明、深度分析原理與操作流程\n\n"
@@ -2468,6 +2487,34 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
             skill_load_mode,
         ],
         outputs=[system_prompt_input, technique_library_input, memory_input, skill_load_status],
+        api_name=False,
+    )
+
+    continue_btn.click(
+        read_continuation_source,
+        inputs=[
+            continue_novel_file,
+            continue_novel_text,
+            continue_novel_url,
+            continue_max_chars,
+            skill_output_lang,
+            continue_extract_brief,
+            analysis_api_key_input,
+            analysis_base_url_input,
+            analysis_model_input,
+            background_input,
+            roles_input,
+            memory_input,
+        ],
+        outputs=[
+            continue_status,
+            continue_preview,
+            full_story_box,
+            background_input,
+            roles_input,
+            memory_input,
+            instruction,
+        ],
         api_name=False,
     )
 

@@ -242,6 +242,26 @@ The abstraction barrier (extract patterns, drop entities; original content only)
 is what separates this from `4. 改寫 Rewrite / Style Transfer`, which transforms
 an existing passage in place.
 
+### Continuation mode — continue your own novel with the skill
+
+The Story Skill tab also has a **續寫模式 ｜ Continue an Existing Novel** section
+(`read_continuation_source`). Attach the novel you actually want to **continue**
+(TXT / pasted text / chapter-directory URL) and it reads the *continuation
+context* — and, **unlike distillation, it keeps the source's real entities**,
+because this is your own story to extend, not an abstract craft reference:
+
+- The prose is loaded into **Full Story** (optionally capped to the most recent
+  N characters — the part continuation writes from).
+- With **extract brief** on, the analysis model pulls a structured brief —
+  `background`, characters (→ the character table), plot-so-far, the current
+  situation / where it left off, open threads, and tone — into **World /
+  Background**, **Characters**, and an appended **Story Memory** block.
+- A continue-from-here directive is placed in **Story Instruction**.
+
+Combine the two halves of the tab: load a distilled skill's craft with
+`①b 直接載入技法` (the *how*) **and** read a continuation source (the *what*),
+then go to `3. 寫作` to continue your own novel in the distilled style.
+
 ## Deeper craft analysis
 
 Every technique card now dissects **how a body part or an action is actually written**, not a few generic sentences. Each card carries five depth fields in addition to the base ones:

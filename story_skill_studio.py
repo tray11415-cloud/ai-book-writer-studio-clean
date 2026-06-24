@@ -256,8 +256,8 @@ def _distill_skill_via_llm(
     return _normalize_skill(skill)
 
 
-def _parse_skill_json(raw: str) -> dict[str, Any]:
-    """Parse the LLM's JSON, tolerating code fences and surrounding prose."""
+def _loads_json_dict(raw: str, what: str = "JSON") -> dict[str, Any]:
+    """Parse an LLM JSON object, tolerating code fences and surrounding prose."""
     text = (raw or "").strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\n", "", text)
@@ -274,12 +274,14 @@ def _parse_skill_json(raw: str) -> dict[str, Any]:
         try:
             parsed = json.loads(text[start : end + 1])
         except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "技能蒸餾的 LLM 回應不是有效 JSON。請改用結構較穩的 Analysis 模型，或重試。"
-            ) from exc
+            raise RuntimeError(f"{what}的 LLM 回應不是有效 JSON。請改用結構較穩的 Analysis 模型，或重試。") from exc
         if isinstance(parsed, dict):
             return parsed
-    raise RuntimeError("技能蒸餾的 LLM 回應未包含 JSON 物件（請改用結構較穩的 Analysis 模型，或重試）。")
+    raise RuntimeError(f"{what}的 LLM 回應未包含 JSON 物件（請改用結構較穩的 Analysis 模型，或重試）。")
+
+
+def _parse_skill_json(raw: str) -> dict[str, Any]:
+    return _loads_json_dict(raw, "技能蒸餾")
 
 
 def _normalize_skill(skill: dict[str, Any]) -> dict[str, Any]:
@@ -469,6 +471,138 @@ def _load_skill_payload(skill_json_str: str, skill_file: Any) -> dict[str, Any]:
         return _normalize_skill(json.loads(text))
     except json.JSONDecodeError as exc:
         raise RuntimeError("技能 JSON 無法解析；請重新蒸餾或檢查檔案。") from exc
+
+
+# --------------------------------------------------------------------------- #
+# Continuation: attach a novel you want to CONTINUE and read the info needed to
+# continue it (its real characters / world / plot-so-far / where it left off).
+# Unlike distillation, this DOES keep the source's entities — it is your own
+# story to extend, not an abstract craft reference.
+# --------------------------------------------------------------------------- #
+
+def read_continuation_source(
+    novel_file: Any,
+    novel_text: str,
+    novel_url: str,
+    max_story_chars: float | int | None,
+    output_language: str,
+    extract_brief: bool,
+    analysis_api_key: str,
+    analysis_base_url: str,
+    analysis_model_name: str,
+    current_background: str,
+    current_roles: Any,
+    current_memory: str,
+) -> tuple[str, str, str, str, Any, str, str]:
+    """Read a to-be-continued novel and load continuation context into the writing area.
+
+    Returns (status, preview_md, full_story, background, roles, memory, instruction):
+    full_story = the prose to continue from; background/roles = extracted (or kept);
+    memory = current memory + a continuation brief; instruction = a continue directive.
+    """
+    empty_roles = current_roles if isinstance(current_roles, list) and current_roles else [["", "", ""]]
+    try:
+        if not (novel_file or (novel_text or "").strip() or (novel_url or "").strip()):
+            return ("[ERROR] 請附上要續寫的小說（上傳 TXT / 貼上正文 / 章節目錄網址）。", "",
+                    "", current_background or "", empty_roles, current_memory or "", "")
+        chapters, source_label = load_chapters(
+            txt_file=novel_file, pasted_text=novel_text, directory_url=novel_url,
+            limit=None, fallback_chunk_chars=200000,
+        )
+        full_story = "\n\n".join(ch.text for ch in chapters).strip()
+        if not full_story:
+            return ("[ERROR] 未能從來源讀到正文。", "", "", current_background or "", empty_roles, current_memory or "", "")
+        cap = to_positive_int(max_story_chars) or 0
+        if cap and len(full_story) > cap:
+            # Keep the most recent part — that is what continuation writes from.
+            full_story = full_story[-cap:]
+
+        background = current_background or ""
+        roles = empty_roles
+        brief_lines: list[str] = []
+        if extract_brief:
+            route = _make_route("Analysis / Grok", analysis_api_key, analysis_base_url, analysis_model_name)
+            brief = _extract_continuation_brief(route, chapters, output_language)
+            if (brief.get("background") or "").strip():
+                background = brief["background"].strip()
+            table = [
+                [c.get("name", ""), c.get("role", ""), c.get("traits", "")]
+                for c in (brief.get("characters") or [])
+                if isinstance(c, dict) and (c.get("name") or c.get("role") or c.get("traits"))
+            ]
+            if table:
+                roles = table
+            brief_lines = _render_continuation_brief(brief)
+
+        brief_body = "\n".join(brief_lines) if brief_lines else "已載入要續寫的小說正文；請從最後一個場景自然接續。"
+        brief_block = f"【續寫資訊（來源：{source_label}）】\n{brief_body}"
+        memory = _join_blocks(current_memory, brief_block)
+        instruction = (
+            "請從目前故事的最後一個場景自然接續往下寫，保持既有人物、世界設定與未解線索的連貫，"
+            "延續既有語氣；不要重述已發生的內容，直接推進新情節。"
+        )
+        preview = (
+            f"# 續寫資訊\n\n- 來源：{source_label}\n- 載入正文字數：{len(full_story)}"
+            f"\n- 擷取摘要：{'是' if extract_brief else '否（僅載入正文）'}\n\n{brief_block}"
+        )
+        status = (
+            "[OK] 已讀取續寫所需資訊並載入寫作區（Full Story ＋ 背景／角色 ＋ 續寫摘要 ＋ 接續指令）。\n"
+            "→ 可先在本面板按『①b 直接載入技法』套上寫作技能，再切到『3. 寫作』直接續寫。"
+        )
+        return status, trim_preview(preview), full_story, background, roles, memory, instruction
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("read_continuation_source failed")
+        return f"[ERROR] {exc}", "", "", current_background or "", empty_roles, current_memory or "", ""
+
+
+def _extract_continuation_brief(route: ModelRoute, chapters: list[Chapter], output_language: str) -> dict[str, Any]:
+    if route.client is None:
+        raise RuntimeError("缺少 Analysis LLM client。")
+    # Bias toward the later chapters — that is where continuation picks up.
+    tail = chapters[-6:] if len(chapters) > 6 else chapters
+    text = "\n\n".join(f"## {c.title}\n{trim_chapter_text(c.text, 4000)}" for c in tail)
+    raw = chat_complete(
+        route.client,
+        label="續寫資訊擷取",
+        model=route.model_name,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "你是小說『續寫前置分析 Agent』。閱讀使用者要續寫的小說，擷取續寫所需的關鍵資訊，"
+                    "以便之後自然接續。只輸出 JSON，不要任何解說或 code fence。"
+                    f"{language_instruction(output_language)}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    '請輸出 JSON：{"background":"世界觀與設定摘要",'
+                    '"characters":[{"name":"","role":"","traits":""}],'
+                    '"plot_so_far":"至今劇情摘要","current_situation":"故事目前停在哪、最後一個場景的狀態與懸念",'
+                    '"open_threads":["未解線索或伏筆"],"tone":"語氣基調"}\n\n'
+                    f"小說內容（以後段為主）：\n{text}"
+                ),
+            },
+        ],
+        temperature=0.2,
+        max_tokens=2500,
+    )
+    return _loads_json_dict(raw, "續寫資訊擷取")
+
+
+def _render_continuation_brief(brief: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    if (brief.get("plot_so_far") or "").strip():
+        lines.append("劇情至今：" + brief["plot_so_far"].strip())
+    if (brief.get("current_situation") or "").strip():
+        lines.append("目前情境（接續點）：" + brief["current_situation"].strip())
+    threads = brief.get("open_threads") or []
+    if threads:
+        lines.append("未解線索：" + "；".join(str(t).strip() for t in threads if str(t).strip()))
+    if (brief.get("tone") or "").strip():
+        lines.append("語氣基調：" + brief["tone"].strip())
+    return lines
 
 
 # --------------------------------------------------------------------------- #
