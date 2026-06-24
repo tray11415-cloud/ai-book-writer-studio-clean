@@ -40,6 +40,7 @@ from report_technique_distiller import load_latest_distilled_library_to_agent_fi
 from story_skill_studio import DEFAULT_ORCHESTRATION_GOAL, DEFAULT_SKILL_DISTILL_GOAL, SKILL_LOAD_MODES
 from story_skill_studio import distill_story_skill, orchestrate_story_prompt
 from story_skill_studio import load_latest_skill_to_agent_fields, load_orchestration_to_agent_fields
+from story_skill_studio import load_skill_techniques_to_agent_fields
 from skill_technique_review import REVIEW_CHOICES, review_skill_and_technique
 from technique_library_builder import ALL_CATEGORY_CHOICES, BOOK_LIBRARY_LOAD_MODES
 from technique_library_builder import DEFAULT_BOOK_LIBRARY_GOAL
@@ -1959,6 +1960,9 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
             skill_distill_status = gr.Textbox(label="Distill Status", lines=5, interactive=False)
             skill_preview = gr.Markdown(label="Skill Preview")
             skill_file_out = gr.File(label="story_skill.json")
+            gr.Markdown("**捷徑**：蒸餾完只想用技法、劇情自己寫？按下面直接把『敘事方式＋描寫技法＋節拍綁定』灌進寫作區（跳過編排）。")
+            skill_direct_load_btn = gr.Button("①b 直接載入技法到寫作區（自己寫劇情）", variant="secondary")
+            skill_direct_load_status = gr.Textbox(label="Direct Load Status", lines=2, interactive=False)
 
         with gr.Accordion("Step 2 ｜ 編排劇情 + 產生提示詞 Orchestrate（全新原創故事）", open=True):
             skill_orch_skill_file = gr.File(label="（可選）載入已保存的 story_skill.json", file_count="single", file_types=[".json"])
@@ -2401,6 +2405,34 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
             skill_tech_state,
             skill_beat_state,
         ],
+        api_name=False,
+    ).then(
+        # Auto-load the orchestration into the writing area right after编排.
+        load_orchestration_to_agent_fields,
+        inputs=[
+            skill_sys_state,
+            skill_tech_state,
+            skill_beat_state,
+            system_prompt_input,
+            technique_library_input,
+            memory_input,
+            skill_load_mode,
+        ],
+        outputs=[system_prompt_input, technique_library_input, memory_input, skill_load_status],
+        api_name=False,
+    )
+
+    skill_direct_load_btn.click(
+        load_skill_techniques_to_agent_fields,
+        inputs=[
+            skill_json_state,
+            skill_orch_skill_file,
+            system_prompt_input,
+            technique_library_input,
+            memory_input,
+            skill_load_mode,
+        ],
+        outputs=[system_prompt_input, technique_library_input, memory_input, skill_direct_load_status],
         api_name=False,
     )
 

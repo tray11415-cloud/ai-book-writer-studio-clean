@@ -516,6 +516,48 @@ def load_orchestration_to_agent_fields(
     return system_prompt, technique_library, memory, status
 
 
+def load_skill_techniques_to_agent_fields(
+    skill_json_str: str,
+    skill_file: Any,
+    current_system_prompt: str,
+    current_technique_library: str,
+    current_memory: str,
+    load_mode: str,
+) -> tuple[str, str, str, str]:
+    """Load ONLY the craft (narrative method + techniques + beat binding) into the
+    writing fields, with no invented plot — for "distill then write your own story".
+
+    Returns (system_prompt, technique_library, memory, status).
+    """
+    try:
+        skill = _load_skill_payload(skill_json_str, skill_file)
+    except Exception as exc:  # noqa: BLE001
+        return (
+            current_system_prompt or "",
+            current_technique_library or "",
+            current_memory or "",
+            f"[ERROR] {exc}（請先在 Step 1 蒸餾，或於 Step 2 上傳 story_skill.json）",
+        )
+    system_block = render_skill_system_prompt(skill)
+    technique_block = render_technique_library(skill)
+    binding_block = "【節拍×技法綁定參考】\n" + (render_beat_plan(skill) or "（無）")
+    append = "Append" in (load_mode or "")
+    if append:
+        system_prompt = _join_blocks(current_system_prompt, system_block)
+        technique_library = _join_blocks(current_technique_library, technique_block)
+        memory = _join_blocks(current_memory, binding_block)
+    else:
+        system_prompt = system_block
+        technique_library = technique_block
+        memory = binding_block
+    status = (
+        "[OK] 已把『敘事方式 + 描寫技法 + 節拍×技法綁定』載入寫作區（不含劇情，"
+        "劇情由你在 Story Instruction 主導）。請切到『3. 寫作』開始寫。"
+        f"模式：{'Append' if append else 'Replace'}。"
+    )
+    return system_prompt, technique_library, memory, status
+
+
 def load_latest_skill_to_agent_fields(
     current_system_prompt: str,
     current_technique_library: str,
@@ -613,6 +655,25 @@ def render_skill_markdown(skill: dict[str, Any]) -> str:
         lines += ["## 可移植寫作守則"]
         lines += [f"{i}. {r}" for i, r in enumerate(rules, 1)]
     return "\n".join(lines).strip() + "\n"
+
+
+def render_skill_system_prompt(skill: dict[str, Any]) -> str:
+    """A craft-only System Prompt: lock the narrative method + rules, leave plot to
+    the user. The concrete beat->technique mapping rides in Story Memory."""
+    nm = skill.get("narrative_method", {})
+    rules = skill.get("transferable_rules") or []
+    parts = ["【寫作技能·鎖定敘事方式與描寫技法（劇情由你在 Story Instruction 自行主導）】"]
+    if nm:
+        parts.append("敘事方式（鎖定）：")
+        parts += [f"- {k}：{v}" for k, v in nm.items()]
+    if rules:
+        parts.append("寫作守則：")
+        parts += [f"- {r}" for r in rules]
+    parts.append(
+        "請依使用者給的情節推進；當前情節走到哪一種節拍，就套用 Technique Library 與 "
+        "Story Memory 裡對應的描寫技法。全程使用全新原創人事物，不得出現任何來源故事的人名、地名、物件或情節。"
+    )
+    return "\n".join(parts).strip()
 
 
 def render_technique_library(skill: dict[str, Any]) -> str:

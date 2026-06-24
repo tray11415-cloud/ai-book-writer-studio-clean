@@ -197,13 +197,25 @@ Three stages, each with a Dry-Run mode for offline checking:
    chapter says which techniques to apply. Saved under
    `book_output/story_skills/orchestrations/<timestamp>/`.
 
-3. **Write** — one click (`Load Into Interactive Writing`) pushes the
-   orchestrated prompt into **System Prompt Override**, the technique cards into
-   **Technique Library**, and the beat plan into **Story Memory**. Switch to
+3. **Write** — the distill area (tab 11) and the writing area (tab 3) bind through
+   a load action that pushes the skill into **System Prompt Override**,
+   **Technique Library**, and **Story Memory**. Switch to
    `3. 寫作 Interactive Writing` and generate — the writing model now follows the
    source's narrative method and applies its techniques at the right beats, with
    entirely original content. Generation still runs through the
    [repetition guard](#cross-response-repetition-guard).
+
+   There are two ways to bind, plus the manual button:
+   - **Distill → write your own** (`①b 直接載入技法到寫作區`): right after Step 1,
+     load *only* the craft (narrative method + technique cards + beat→technique
+     mapping) — no invented plot. You drive the plot via `Story Instruction`, and
+     the model applies the bound techniques at the matching beat type.
+   - **Orchestrate → auto-load**: finishing Step 2 automatically loads the
+     orchestrated, plot-bound prompt into the writing area (no manual click).
+   - **Manual** (`③ 載入到寫作區` / `載入最近一次編排`): push the latest
+     orchestration whenever you want.
+
+   All three honor the **Load Mode** (Replace vs Append).
 
 The abstraction barrier (extract patterns, drop entities; original content only)
 is what separates this from `4. 改寫 Rewrite / Style Transfer`, which transforms
