@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -51,6 +52,12 @@ DEFAULT_SKILL_DISTILL_GOAL = (
     "只萃取敘事方式、描寫技法與節拍結構模板；"
     "嚴禁保留原作的任何人名、地名、物件或具體情節事件——只要『怎麼寫』，不要『寫了什麼』。"
 )
+
+# Max output tokens for the continuation director's manual (env-overridable).
+# Larger = a longer/more detailed plan, but remember the plan is fed into the
+# WRITING model as the Story Instruction, so it competes with the story context;
+# keep it well under the writing model's context window.
+CONTINUATION_PLAN_MAX_TOKENS = int(os.getenv("BOOK_WRITER_CONTINUATION_PLAN_MAX_TOKENS", "16000"))
 
 DEFAULT_ORCHESTRATION_GOAL = (
     "根據蒸餾出的寫作技能與一個全新的故事種子，編排一個全新原創故事："
@@ -759,7 +766,7 @@ def _orchestrate_continuation(
             },
         ],
         temperature=0.6,
-        max_tokens=8000,
+        max_tokens=CONTINUATION_PLAN_MAX_TOKENS,
     )
 
 

@@ -89,8 +89,10 @@ DEFAULT_LORA_MODEL = os.getenv("UI_LORA_MODEL", LORA_MODEL_NAME)
 PIPELINE_DIRECT = "Selected Provider Only"
 PIPELINE_HYBRID = "Hybrid: NALANG Plan -> LoRA Draft -> NALANG Polish"
 PIPELINES = [PIPELINE_DIRECT, PIPELINE_HYBRID]
-BOOK_WRITER_MAX_TOKENS = int(os.getenv("BOOK_WRITER_MAX_TOKENS", "24000"))
-BOOK_WRITER_DEFAULT_TOKENS = int(os.getenv("BOOK_WRITER_DEFAULT_TOKENS", str(BOOK_WRITER_MAX_TOKENS)))
+BOOK_WRITER_MAX_TOKENS = int(os.getenv("BOOK_WRITER_MAX_TOKENS", "100000"))
+# Default request size stays moderate so a normal generation does not ask for the
+# full ceiling every time; drag the Max Tokens slider toward 100k for long runs.
+BOOK_WRITER_DEFAULT_TOKENS = min(int(os.getenv("BOOK_WRITER_DEFAULT_TOKENS", "24000")), BOOK_WRITER_MAX_TOKENS)
 BOOK_WRITER_PLAN_MAX_TOKENS = int(os.getenv("BOOK_WRITER_PLAN_MAX_TOKENS", "2400"))
 BOOK_WRITER_REWRITE_MAX_TOKENS = int(os.getenv("BOOK_WRITER_REWRITE_MAX_TOKENS", "8000"))
 DEFAULT_SYSTEM_PROMPT = """You are a senior long-form fiction writer and story director.
