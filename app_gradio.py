@@ -41,6 +41,7 @@ from story_skill_studio import DEFAULT_ORCHESTRATION_GOAL, DEFAULT_SKILL_DISTILL
 from story_skill_studio import distill_story_skill, orchestrate_story_prompt
 from story_skill_studio import load_latest_skill_to_agent_fields, load_orchestration_to_agent_fields
 from story_skill_studio import load_skill_techniques_to_agent_fields
+from project_saves import delete_project_slot, load_project_slot, refresh_slots, save_project_slot
 from skill_technique_review import REVIEW_CHOICES, review_skill_and_technique
 from technique_library_builder import ALL_CATEGORY_CHOICES, BOOK_LIBRARY_LOAD_MODES
 from technique_library_builder import DEFAULT_BOOK_LIBRARY_GOAL
@@ -1879,10 +1880,29 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
         technique_report_file = gr.File(label="Technique Report")
 
     with gr.Tab("8. 存讀檔 Save / Load"):
-        save_btn = gr.Button("Save Project", variant="primary")
-        save_file = gr.Textbox(label="Saved File")
-        load_btn = gr.File(label="Load Project JSON", file_count="single", file_types=[".json"])
-        load_msg = gr.Markdown()
+        with gr.Accordion("命名多存檔 Named Save Slots（含蒸餾技能與所有設定）", open=True):
+            gr.Markdown(
+                "把目前的**故事設定、記憶、技法庫、提示詞，以及在『11. 故事技能』蒸餾出的 SKILL** "
+                "一起存成一個**命名存檔**。可建立多個存檔,隨時從下拉選單載入或刪除。"
+            )
+            with gr.Row():
+                slot_name_input = gr.Textbox(label="存檔名稱 Slot Name", placeholder="例如：仙俠技能v1 / 懸疑黑暗風")
+                slot_note_input = gr.Textbox(label="備註 Note（可選）", placeholder="這個存檔的用途、來源小說、進度...")
+            slot_save_btn = gr.Button("💾 Save To Slot（存成命名存檔）", variant="primary")
+            with gr.Row():
+                slot_dropdown = gr.Dropdown(choices=[], label="選擇存檔 Saved Slots", interactive=True)
+                slot_refresh_btn = gr.Button("🔄 Refresh", variant="secondary", scale=0)
+            with gr.Row():
+                slot_load_btn = gr.Button("📂 Load Slot（載入選取的存檔）", variant="primary")
+                slot_delete_btn = gr.Button("🗑 Delete Slot", variant="stop")
+            slot_status = gr.Textbox(label="Slot Status", lines=3, interactive=False)
+            slot_info = gr.Markdown()
+
+        with gr.Accordion("單檔匯出 / 匯入 Export / Import (JSON file)", open=False):
+            save_btn = gr.Button("Save Project", variant="primary")
+            save_file = gr.Textbox(label="Saved File")
+            load_btn = gr.File(label="Load Project JSON", file_count="single", file_types=[".json"])
+            load_msg = gr.Markdown()
 
     with gr.Tab("9. 技法回灌與檢閱 Skill / Technique Review"):
         with gr.Accordion("full_report.md -> Compact Technique Library -> Writing AGENT", open=True):
@@ -2503,6 +2523,62 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
         ],
         api_name=False,
     ).then(lambda: "Project loaded.", outputs=load_msg, api_name=False)
+
+    slot_save_btn.click(
+        save_project_slot,
+        inputs=[
+            slot_name_input,
+            slot_note_input,
+            background_input,
+            roles_input,
+            lore_input,
+            full_story_box,
+            memory_input,
+            style_dna_output,
+            style_samples_output,
+            chronicle_output,
+            technique_library_input,
+            system_prompt_input,
+            custom_director_input,
+            instruction,
+            skill_json_state,
+        ],
+        outputs=[slot_status, slot_dropdown, slot_info],
+        api_name=False,
+    )
+
+    slot_refresh_btn.click(refresh_slots, outputs=[slot_dropdown, slot_info], api_name=False)
+
+    slot_load_btn.click(
+        load_project_slot,
+        inputs=[slot_dropdown],
+        outputs=[
+            background_input,
+            roles_input,
+            lore_input,
+            full_story_box,
+            memory_input,
+            style_dna_output,
+            style_samples_output,
+            chronicle_output,
+            technique_library_input,
+            system_prompt_input,
+            custom_director_input,
+            instruction,
+            skill_json_state,
+            slot_status,
+        ],
+        api_name=False,
+    )
+
+    slot_delete_btn.click(
+        delete_project_slot,
+        inputs=[slot_dropdown],
+        outputs=[slot_status, slot_dropdown, slot_info],
+        api_name=False,
+    )
+
+    demo.load(refresh_slots, outputs=[slot_dropdown, slot_info], api_name=False)
 
     demo.load(
         load_saved_reference_shelf_ui,

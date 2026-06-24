@@ -108,7 +108,7 @@ The studio is organized as a single top-to-bottom pipeline. The tab order **is**
 5. `5. 章節技法分析 Chapter Craft Analysis` — per-chapter deep report (`full_report.md`).
 6. `6. 劇情編排 Plot Ideation`.
 7. `7. 深度技法書庫 Deep Technique Book` — build a searchable hierarchy such as `容顏描寫 / 眼睛描寫`, `身材描寫 / 手與指節描寫`, `動作描寫 / 喝酒飲茶描寫` from the Reference Library, then load matched techniques into the writing AGENT.
-8. `8. 存讀檔 Save / Load`.
+8. `8. 存讀檔 Save / Load` — **named multi-slot saves**: bundle the story bible, memory, technique library, prompts, **and the distilled Story Skill** into a named slot; keep many, load/delete any from a dropdown (see [Named save slots](#named-save-slots)). Single-file JSON export/import remains under an accordion.
 9. `9. 技法回灌與檢閱 Skill / Technique Review` — distill `full_report.md` into a compact `Technique Library`, and review the latest deep outputs locally.
 10. `10. 說明書 Manual` — the full panel guide rendered in-app.
 11. `11. 故事技能 Story Skill` — distill an input novel into a reusable, **plot-bound** writing skill, orchestrate an original technique-bound prompt from it, and load it straight into Interactive Writing (see [Story Skill](#story-skill-distill--orchestrate--write)).
@@ -165,6 +165,27 @@ All are optional; defaults are shown. Set `BOOK_WRITER_REPETITION_GUARD=0`
 Some baseline overlap is normal (names, function words), so judge a threshold
 change against a baseline run rather than against the absolute number. Lowering
 the threshold or raising the retry count makes generations stricter but slower.
+
+## Named save slots
+
+Tab `8. 存讀檔 Save / Load` (module `project_saves.py`) keeps **many named saves**
+instead of one file. A slot bundles the full working state — `background`,
+characters, lorebook, full story, memory, Style DNA / samples, chronicle,
+technique library, System Prompt Override, director note, story instruction —
+**and the currently distilled Story Skill JSON**. Saves live under
+`book_output/saves/<slug>.json`.
+
+- **Save To Slot** — name it (optional note), and the current state + skill are
+  written to that slot (re-saving the same name updates it).
+- **Saved Slots dropdown + info table** — every slot with its time, story length,
+  whether it carries a skill (and the skill's source / technique & beat counts),
+  and your note.
+- **Load Slot** — restores all fields *and* the skill, so you can jump to
+  `11. 故事技能` and orchestrate / direct-load from the restored skill.
+- **Delete Slot** — removes a save.
+
+The older single-file JSON export/import is still available under the
+Export / Import accordion.
 
 ## Story Skill (distill → orchestrate → write)
 
