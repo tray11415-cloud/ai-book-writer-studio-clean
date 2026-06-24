@@ -20,7 +20,9 @@ def _normalize_base_url(base_url: str) -> str:
 
 def get_config(local_url: str | None = None) -> Dict:
     """Get the configuration for the agents."""
-    load_dotenv(get_dotenv_path())
+    # override=True so an edited .env is reflected on subsequent calls instead of
+    # returning stale values already present in os.environ from a prior load.
+    load_dotenv(get_dotenv_path(), override=True)
 
     base_url = _normalize_base_url(
         local_url

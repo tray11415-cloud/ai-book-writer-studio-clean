@@ -166,6 +166,13 @@ lora_training/source_texts/*
 *.onnx
 StartAIBookWriterStudio.exe
 
+# Generation runtime artifacts and code-review scratch
+generation_logs/
+*.backup
+lora_training/logs/
+review_digest.txt
+review_briefs/
+
 # Spyder project settings
 .spyderproject
 .spyproject

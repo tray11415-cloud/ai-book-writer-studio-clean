@@ -15,6 +15,7 @@ Diagnosis (+ markdown report + json).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -25,6 +26,8 @@ from pathlib import Path
 from typing import Callable
 
 from openai import OpenAI
+
+logger = logging.getLogger(__name__)
 
 from rewrite_agent import (
     AGENT_DIR,
@@ -145,31 +148,52 @@ def split_analysis_windows(text: str, chunk_chars: int) -> list[AnalysisWindow]:
     Analysis works on bigger units than the 900-char rewrite chunks so Grok sees
     enough context and the call count stays sane.
     """
-    chunk_chars = max(1500, int(chunk_chars))
+    requested_chars = int(chunk_chars)
+    chunk_chars = max(1500, requested_chars)
+    if requested_chars < 1500:
+        logger.warning(
+            "analysis_chunk_chars=%s below minimum; clamped to %s.", requested_chars, chunk_chars
+        )
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     chapters = split_into_chapters(normalized)
     windows: list[AnalysisWindow] = []
+    # `cursor` is the running character offset into the *original normalized text*.
+    # We advance it by each chapter's full length (incl. the title + separators we
+    # synthesise) so window char_start/char_end stay aligned with the source.
     cursor = 0
     win_index = 0
     for chapter_index, (title, body) in enumerate(chapters):
         chapter_text = (title + "\n\n" + body).strip() if title else body.strip()
         if not chapter_text:
+            cursor += len(body) + (len(title) + 2 if title else 0)
             continue
         paragraphs = [p for p in re.split(r"\n\s*\n", chapter_text) if p.strip()]
+        # Offset of the start of `chapter_text` within the original text.
+        chapter_cursor = cursor
         buffer = ""
         for para in paragraphs:
             candidate = (buffer + "\n\n" + para).strip() if buffer else para
             if len(candidate) <= chunk_chars or not buffer:
                 buffer = candidate
                 continue
-            windows.append(AnalysisWindow(win_index, chapter_index, title, buffer, cursor, cursor + len(buffer)))
+            windows.append(
+                AnalysisWindow(
+                    win_index, chapter_index, title, buffer, chapter_cursor, chapter_cursor + len(buffer)
+                )
+            )
             win_index += 1
-            cursor += len(buffer)
+            # Advance past this window's text plus the "\n\n" separator before the next paragraph.
+            chapter_cursor += len(buffer) + 2
             buffer = para
         if buffer.strip():
-            windows.append(AnalysisWindow(win_index, chapter_index, title, buffer, cursor, cursor + len(buffer)))
+            windows.append(
+                AnalysisWindow(
+                    win_index, chapter_index, title, buffer, chapter_cursor, chapter_cursor + len(buffer)
+                )
+            )
             win_index += 1
-            cursor += len(buffer)
+        # Advance the global cursor past this whole chapter (title + separator + body).
+        cursor += len(body) + (len(title) + 2 if title else 0)
     return windows
 
 
@@ -265,20 +289,57 @@ class Diagnosis:
         return "\n\n".join(lines)
 
 
-def _extract_json(text: str) -> dict | None:
-    text = text.strip()
-    fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
-    if fence:
-        text = fence.group(1)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    for candidate in (text[start : end + 1], text):
+def _decode_first_object(text: str) -> dict | None:
+    """Return the first complete JSON object found in `text`, or None.
+
+    Scans forward to each '{' and uses JSONDecoder.raw_decode, which stops at the
+    first valid JSON boundary (handling embedded braces and trailing junk).
+    """
+    decoder = json.JSONDecoder()
+    search_from = 0
+    while True:
+        start = text.find("{", search_from)
+        if start == -1:
+            return None
         try:
-            return json.loads(candidate)
-        except Exception:  # noqa: BLE001
+            obj, _end = decoder.raw_decode(text[start:])
+        except ValueError:
+            search_from = start + 1
             continue
+        if isinstance(obj, dict):
+            return obj
+        search_from = start + 1
+
+
+def _extract_json(text: str) -> dict | None:
+    """Best-effort extraction of a JSON object from a model response.
+
+    Handles fenced (```json ... ```), unfenced, missing/malformed fences, and
+    responses with surrounding prose. Tries fence content first, then the raw text.
+    """
+    text = text.strip()
+    candidates: list[str] = []
+
+    # Non-greedy so we capture each fenced block independently rather than spanning
+    # from the first ``` to the last; collect all fences as candidates.
+    for fence in re.finditer(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL):
+        candidates.append(fence.group(1).strip())
+    candidates.append(text)  # fallback: scan the whole response
+
+    for candidate in candidates:
+        # Fast path: candidate is itself valid JSON.
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except ValueError:
+            pass
+        # Robust path: find the first complete JSON object within the candidate.
+        obj = _decode_first_object(candidate)
+        if obj is not None:
+            return obj
+
+    logger.warning("_extract_json: no valid JSON object found in model response.")
     return None
 
 
@@ -473,8 +534,23 @@ def analyze_manuscript(
 
 
 def load_diagnosis(json_path: str | Path) -> Diagnosis:
-    data = json.loads(read_text_file(json_path))
+    try:
+        raw = read_text_file(json_path)
+    except FileNotFoundError as exc:
+        raise ValueError(f"找不到診斷書檔案：{json_path}") from exc
+    except (PermissionError, OSError) as exc:
+        logger.warning("load_diagnosis: failed to read %s: %s", json_path, exc)
+        raise ValueError(f"診斷書檔案無法讀取：{json_path}") from exc
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("load_diagnosis: corrupted JSON in %s: %s", json_path, exc)
+        raise ValueError(f"診斷書檔案損毀或格式錯誤：{json_path}。請重新分析。") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"診斷書檔案格式不符（非 JSON 物件）：{json_path}。請重新分析。")
     d = data.get("diagnosis", data)
+    if not isinstance(d, dict):
+        raise ValueError(f"診斷書內容格式錯誤：{json_path}。請重新分析。")
     return Diagnosis(
         overall_analysis=d.get("overall_analysis", ""),
         continuity_diagnosis=d.get("continuity_diagnosis", ""),

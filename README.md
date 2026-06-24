@@ -1,284 +1,288 @@
 # AI Book Writer Studio
 
-AI Book Writer Studio 是一套本機小說創作工作台，核心用途是把「設定、參考素材、章節分析、技法回灌、互動寫作、全文改寫」放在同一個 Gradio 介面裡操作。專案支援 OpenAI 相容 API、本機 LoRA 服務、Grok/xAI 分析路由，以及獨立的全文改寫 AGENT。
+A Gradio-based studio for long-form Chinese fiction. It drives a writing model
+(NALANG and/or a local LoRA) through an interactive, top-to-bottom pipeline:
+core settings and story bible, a global reference shelf, interactive writing,
+rewrite / style transfer, chapter-craft analysis, plot ideation, a searchable
+"deep technique" library, save/load, and a technique review/feedback loop.
 
-這份資料夾是可分享的乾淨副本：不包含 `.env`、API key、個人稿件、訓練素材、模型權重、生成輸出、虛擬環境、打包成品或版本紀錄。
+The studio talks to OpenAI-compatible endpoints through a small local
+compatibility proxy (`compat_proxy.py`), so the same code path serves NALANG,
+Grok (xAI), and a local LoRA server. Generation includes a cross-response
+anti-repetition guard and long-form memory (see
+[Cross-Response Repetition Guard](#cross-response-repetition-guard)).
 
-## 功能總覽
+> **Legacy:** the original AutoGen multi-agent book generator still ships in
+> this repo (`main.py`, `agents.py`, `book_generator.py`,
+> `outline_generator.py`, `config.py`) and remains usable. The sections below
+> document the current Gradio studio; the legacy pipeline is summarized under
+> [Legacy AutoGen pipeline](#legacy-autogen-pipeline).
 
-- 互動式長篇小說寫作：依照故事設定、技法庫與章節方向生成正文。
-- 參考書架：集中管理小說、報告、技法檔，供後續分析與寫作使用。
-- 章節技法分析：把章節拆成技法、節奏、感官、人物動作與句式層次。
-- 深度技法書庫：從參考書架建立可搜尋的技巧卡，並載入寫作 AGENT。
-- 劇情編排：用多模型協作做主線、轉折、伏筆與章節節奏規劃。
-- 技法回灌：把 `full_report.md` 蒸餾成精簡技法庫，再送回寫作欄位。
-- 全文改寫 AGENT：支援 Grok 診斷、本機 LoRA、外部 API 或混合模式改寫。
-- LoRA 訓練與服務：提供資料準備、訓練腳本、OpenAI 相容本機服務端。
+## Features
 
-## 需求
+- Single Gradio studio organized as a guided writing pipeline (10 tabs).
+- Model routing across NALANG (writing), Grok/xAI (analysis), and a local LoRA.
+- Interactive scene-by-scene writing and rewrite / style transfer.
+- Per-chapter "chapter craft" analysis producing a deep `full_report.md`.
+- A searchable **deep technique book** built from a global reference shelf.
+- Cross-response repetition guard + extractive long-form memory for continuity.
+- Save / load of sessions and model configuration to `book_output/`.
 
-- Windows 10/11。
-- Python 3.10 以上，建議 3.11。
-- 可連線的 OpenAI 相容文字模型 API。
-- 若要使用 Grok 分析，需 xAI API key。
-- 若要使用本機 LoRA，需已下載的基礎模型與 LoRA 權重，並具備足夠 GPU/記憶體。
+## Entry points
 
-主要 Python 依賴列在：
+- **`app_gradio.py`** — the main Gradio studio. Run it directly to launch the
+  full UI: `python app_gradio.py`. This is what `start_studio.bat` runs.
+- **`studio_launcher.py`** — the Windows EXE/launcher front end. It picks an
+  open local port, starts the studio via `start_studio.bat`, and opens the
+  browser. This is the code behind `StartAIBookWriterStudio.exe`.
+- **`web_app.py`** — a lightweight Flask chat UI for conversational
+  scene-by-scene writing against the same model routing. Run with
+  `python web_app.py` (or `start_web.bat`). Reply length is controlled by
+  `BOOK_WRITER_CHAT_MAX_TOKENS`.
 
-- `requirements.txt`：Studio、Web app、代理與一般功能。
-- `lora_training/requirements-lora.txt`：LoRA 訓練與本機推理服務。
+## Installation
 
-## 快速啟動
+1. Clone the repository.
 
-1. 打開 PowerShell，進入專案資料夾：
-
-```powershell
-cd C:\Projects\ai-book-writer-clean-share
+2. Create a virtual environment (the project is developed against `.venv`):
+```bash
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 ```
 
-2. 複製公開環境範例：
-
-```powershell
-copy .env.example .env
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
 ```
 
-3. 編輯 `.env`，填入自己的 API key 與模型設定。
+4. Configure your endpoints and keys:
+```bash
+cp .env.example .env   # On Windows: copy .env.example .env
+```
+Then edit `.env` and fill in your NALANG / Grok / LoRA base URLs, models, and
+API keys. **Never commit `.env`** — it is gitignored, and only
+`.env.example` (placeholders) should be tracked.
 
-4. 啟動完整 Studio：
+## Usage
+
+Launch the Gradio studio:
+```bash
+python app_gradio.py
+```
+or, on Windows, double-click `StartAIBookWriterStudio.exe` (see
+[Windows launcher](#windows-launcher)).
+
+For the lightweight chat UI instead of the full studio:
+```bash
+python web_app.py
+```
+
+## Configuration
+
+Endpoints, models, and API keys are read from `.env` (see `.env.example` for
+the full list) and surfaced in the studio under `1. 設定 Core Settings`. Model
+routing and the repetition guard can also be tuned via environment variables —
+see [Model routing](#model-routing) and
+[Cross-Response Repetition Guard](#cross-response-repetition-guard).
+
+## Windows launcher
+
+Double-click `StartAIBookWriterStudio.exe` to start the Gradio studio. The launcher chooses an open local port, runs `start_studio.bat`, and opens the browser automatically.
+
+For a panel-by-panel guide, see [AI_Book_Writer_Studio_面板說明書.md](AI_Book_Writer_Studio_面板說明書.md).
+
+To rebuild the launcher:
 
 ```bat
-start_studio.bat
-```
-
-第一次啟動會建立 `.venv` 並安裝依賴，時間較長。啟動後瀏覽器會開啟本機 Gradio 介面。
-
-## 環境設定
-
-`.env.example` 提供三條主要路由：
-
-```env
-# 寫作與改寫路由，預設走本機 compat proxy
-OPENAI_BASE_URL=http://127.0.0.1:8000/v1
-OPENAI_MODEL=nalang-xl-0826-10k
-OPENAI_API_KEY=replace-with-your-nalang-api-key
-UPSTREAM_OPENAI_BASE_URL=https://www.gpt4novel.com/api/xiaoshuoai/ext/v1
-
-# 分析路由，供 Grok/xAI 使用
-XAI_BASE_URL=https://api.x.ai/v1
-XAI_MODEL=grok-4.3
-XAI_API_KEY=replace-with-your-xai-api-key
-
-# 本機 LoRA 路由
-UI_LORA_BASE_URL=http://127.0.0.1:8010/v1
-UI_LORA_MODEL=qwen3-4b-novel-lora
-```
-
-注意事項：
-
-- `.env` 不應提交或分享。
-- API key 也可以在 Studio 的模型設定欄位輸入，並儲存到本機 `book_output/model_config.json`。
-- 乾淨副本不包含 `book_output`，第一次執行時程式會自行建立。
-
-## 啟動腳本
-
-- `start_studio.bat`：啟動主要 Gradio Studio。
-- `start_web.bat`：啟動簡化 Flask Web app。
-- `start_lora_server.bat`：啟動 OpenAI 相容 LoRA 服務端。
-- `prepare_lora_data.bat`：整理訓練語料。
-- `train_lora_qwen.bat`：執行 LoRA 訓練。
-- `改寫AGENT/start_rewrite_agent.bat`：啟動獨立全文改寫工具。
-- `build_studio_launcher.bat`：重新打包 Windows 啟動器。乾淨副本未附帶 exe，需自行建置。
-
-## Studio 工作流程
-
-Studio 的分頁順序就是建議操作順序：
-
-1. `設定 Core Settings`：設定模型、API、故事 Bible、Memory 與技法欄位。
-2. `參考書架 Reference Library`：加入小說、報告、MD/TXT/JSON 參考來源。
-3. `寫作 Interactive Writing`：依照設定與技法庫生成正文。
-4. `改寫 Rewrite / Style Transfer`：做局部改寫、風格轉換與文字修整。
-5. `章節技法分析 Chapter Craft Analysis`：逐章輸出 `full_report.md`。
-6. `劇情編排 Plot Ideation`：規劃章節、伏筆、衝突與轉折。
-7. `深度技法書庫 Deep Technique Book`：從參考書架建立可搜尋技法卡。
-8. `存讀檔 Save / Load`：保存或載入專案狀態。
-9. `技法回灌與檢閱 Skill / Technique Review`：蒸餾報告並載入寫作 AGENT。
-10. `說明書 Manual`：在 app 裡閱讀完整面板操作說明。
-
-更細的面板說明請看 `AI_Book_Writer_Studio_面板說明書.md`。
-
-## 典型用法
-
-### 從零開始寫一章
-
-1. 到 `設定` 填入故事設定、角色、世界觀與模型路由。
-2. 到 `參考書架` 加入想模仿或分析的素材。
-3. 到 `深度技法書庫` 建立技法卡，搜尋需要的技法並載入寫作 AGENT。
-4. 到 `寫作` 填入章節目標、場景、人物與禁忌事項。
-5. 生成正文後，回到 `章節技法分析` 或 `改寫` 做修整。
-
-### 把分析結果回灌成寫作技巧
-
-1. 在 `章節技法分析` 產出 `book_output/chapter_craft_reports/<timestamp>/full_report.md`。
-2. 到 `技法回灌與檢閱` 上傳或貼入 `full_report.md`。
-3. 按 `Distill full_report To Compact Library`。
-4. 按 `Load Distilled Library To Writing AGENT`。
-5. 回到 `寫作`，下一次生成會讀到新的技法欄位。
-
-### 使用參考書架建立深度技法書
-
-1. 到 `參考書架` 加入多個 TXT/MD/JSON 來源。
-2. 到 `深度技法書庫` 按 `Build Technique Book From Reference Shelf`。
-3. 搜尋例如 `眼睛`、`手`、`動作`、`喝酒`、`節奏` 等關鍵詞。
-4. 選中結果後載入寫作 AGENT。
-
-## 全文改寫 AGENT
-
-獨立工具位於 `改寫AGENT/`，適合處理整份 manuscript：
-
-```powershell
-cd C:\Projects\ai-book-writer-clean-share
-.\改寫AGENT\start_rewrite_agent.bat
-```
-
-預設會開在 `http://127.0.0.1:7870` 起跳的可用 port。
-
-主要流程：
-
-1. 上傳 `.txt` 或 `.md`，或直接貼全文。
-2. 可先用 Grok 做 `全篇分析診斷`。
-3. 勾選 `套用最新診斷書`。
-4. 選擇改寫模式：本機 LoRA、外部 API、混合模式或完整混合模式。
-5. 執行後輸出到 `改寫AGENT/output/`。
-
-詳細請看 `改寫AGENT/README.md`。
-
-## LoRA 訓練與本機服務
-
-乾淨副本只包含訓練與服務程式，不包含訓練素材、資料集、權重或 checkpoint。
-
-建議流程：
-
-1. 把你有權使用的素材放到 `lora_training/source_texts/`。
-2. 執行：
-
-```bat
-prepare_lora_data.bat
-```
-
-3. 安裝 LoRA 依賴：
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r lora_training\requirements-lora.txt
-```
-
-4. 執行訓練：
-
-```bat
-train_lora_qwen.bat
-```
-
-5. 啟動本機 OpenAI 相容服務：
-
-```bat
-start_lora_server.bat
-```
-
-LoRA 服務預設對外提供 `http://127.0.0.1:8010/v1`，Studio 會透過 `UI_LORA_BASE_URL` 與 `UI_LORA_MODEL` 連接。
-
-## 目錄說明
-
-```text
-.
-├── app_gradio.py                         # 主要 Gradio Studio
-├── web_app.py                            # 簡化 Web app
-├── compat_proxy.py                       # OpenAI 相容代理
-├── config.py / env_utils.py              # 環境與模型設定
-├── technique_library_builder.py          # 深度技法書庫
-├── chapter_craft_skill.py                # 章節技法分析
-├── report_technique_distiller.py         # full_report 蒸餾
-├── lora_training/                        # LoRA 訓練與服務腳本
-├── skills/                               # Studio 內部技能說明
-├── 改寫AGENT/                            # 獨立全文改寫工具
-├── AI_Book_Writer_Studio_面板說明書.md    # 面板操作手冊
-├── .env.example                          # 可公開設定範本
-└── requirements.txt                      # 主程式依賴
-```
-
-執行後會自動產生但不應分享的目錄：
-
-- `.venv/`
-- `book_output/`
-- `改寫AGENT/output/`
-- `lora_training/data/`
-- `lora_training/runs/`
-- `lora_training/lora_output/`
-
-## 打包 Windows 啟動器
-
-乾淨副本不包含已打包的 `StartAIBookWriterStudio.exe`。如需建立：
-
-```bat
-start_studio.bat
 build_studio_launcher.bat
 ```
 
-建置完成後會產生：
+## Integrated workflow & tabs
 
-```text
-dist/
-StartAIBookWriterStudio.exe
+The studio is organized as a single top-to-bottom pipeline. The tab order **is** the recommended order:
+
+1. `1. 設定 Core Settings` — models + story bible.
+2. `2. 參考書架 Reference Library` — a **global** shelf; add or remove novels/reports (MD/TXT/JSON) at any time. Every analysis pulls from here.
+3. `3. 寫作 Interactive Writing` — generate with the loaded techniques.
+4. `4. 改寫 Rewrite / Style Transfer`.
+5. `5. 章節技法分析 Chapter Craft Analysis` — per-chapter deep report (`full_report.md`).
+6. `6. 劇情編排 Plot Ideation`.
+7. `7. 深度技法書庫 Deep Technique Book` — build a searchable hierarchy such as `容顏描寫 / 眼睛描寫`, `身材描寫 / 手與指節描寫`, `動作描寫 / 喝酒飲茶描寫` from the Reference Library, then load matched techniques into the writing AGENT.
+8. `8. 存讀檔 Save / Load`.
+9. `9. 技法回灌與檢閱 Skill / Technique Review` — distill `full_report.md` into a compact `Technique Library`, and review the latest deep outputs locally.
+10. `10. 說明書 Manual` — the full panel guide rendered in-app.
+
+## Model routing
+
+- Writing: NALANG + Local LoRA.
+- Analysis: Grok.
+- Plot Ideation: Grok + NALANG + Local LoRA together.
+- Deep Technique Book: distills the global Reference Library into a searchable hierarchy of **deep** technique cards.
+
+## Cross-Response Repetition Guard
+
+Novel models tend to recycle the same descriptive phrases, metaphors, and scene
+套路 every time they are called again. The OpenAI `frequency_penalty` /
+`presence_penalty` parameters only act *within a single completion*, so they do
+nothing about the same clichés reappearing across separate continuations — which
+is what keeps the **横向重复比例 (cross-response repetition ratio)** high.
+
+`repetition_guard.py` is a pure-Python module (no extra API calls) that the
+studio uses to keep long stories fresh and continuous:
+
+- **Overused-phrase mining** (`extract_overused_phrases`) scans the whole story
+  so far and surfaces the wordings that recur most, so the model can be handed
+  an explicit "stop reusing these" avoid-list.
+- **Overlap measurement** (`repetition_ratio`) scores how much a fresh
+  continuation overlaps the prior story (0..1). When the ratio exceeds the
+  threshold, the studio regenerates with a stronger ban (`repeated_spans` +
+  `build_avoid_directive`), up to a configurable retry budget.
+- **Long-form memory** (`build_longform_memory`) builds an extractive digest of
+  earlier content that has scrolled out of the recent-context window, so long
+  stories keep continuity without re-reading (and re-echoing) the full prose.
+
+Phrase detection uses character n-grams for CJK text and word n-grams for
+mostly-Latin text, so it handles Chinese (no spaces) and English alike.
+Character names and proper nouns are explicitly exempt from the avoid-list —
+the guard targets *phrasing*, not *people or objects*.
+
+### Environment variables
+
+All are optional; defaults are shown. Set `BOOK_WRITER_REPETITION_GUARD=0`
+(or `false`/`off`/`no`) to disable the guard entirely.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_WRITER_REPETITION_GUARD` | `1` | Master on/off switch for the guard. |
+| `BOOK_WRITER_REPETITION_THRESHOLD` | `0.30` | Overlap ratio above which a continuation is regenerated. |
+| `BOOK_WRITER_REPETITION_MAX_RETRIES` | `1` | Max regeneration retries when overlap is too high. |
+| `BOOK_WRITER_REPETITION_NGRAM` | `8` | CJK char n-gram size used to measure overlap. |
+| `BOOK_WRITER_REPETITION_PHRASE_NGRAM` | `10` | CJK char n-gram size used to mine recurring 套路 phrases. |
+| `BOOK_WRITER_REPETITION_MIN_COUNT` | `3` | Min recurrences before a phrase counts as overused. |
+| `BOOK_WRITER_REPETITION_TOP_K` | `14` | How many overused phrases to feed back as an avoid-list. |
+
+Some baseline overlap is normal (names, function words), so judge a threshold
+change against a baseline run rather than against the absolute number. Lowering
+the threshold or raising the retry count makes generations stricter but slower.
+
+## Deeper craft analysis
+
+Every technique card now dissects **how a body part or an action is actually written**, not a few generic sentences. Each card carries five depth fields in addition to the base ones:
+
+- `Anatomy Breakdown` — the body part / action split into observable micro-units in writing order (e.g. eyes = gaze-landing → eye-movement → dwell-time → one wet/light detail → the other person's reaction).
+- `Sentence Rhythm` — clause length, pauses, punctuation cadence.
+- `Word Palette` — concrete verbs/nouns/textures to use, and abstractions to avoid.
+- `Sensory Layering` — which sense leads, in what order, how many details.
+- `Weak vs Strong` — a short weak-vs-strong example sentence pair.
+
+These appear in the Deep Technique Book (both the Grok and the offline Dry-Run paths), in the Focused Technique Sheet, and in the Chapter Craft synthesis report.
+
+For whole-book TXT analysis without a table of contents, upload the TXT in `5. 章節技法分析 Chapter Craft Analysis`, set `Chapter Limit (0 = Full Book)` to `0`, and use `Max Chars / Chapter / Auto Chunk` as the automatic chunk size. The same no-heading TXT fallback is used by the single-novel distiller in `7. 深度技法書庫`.
+
+To inspect what has actually been distilled, open `9. 技法回灌與檢閱 Skill / Technique Review`, choose `Skill + Latest Technique`, or paste a path such as `C:\Users\User\Downloads\full_report (1).md` under `Custom Markdown / JSON Path`.
+
+To build the searchable technique book, first add novels/reports into `2. 參考書架 Reference Library` (remove selected references or clear the shelf at any time). Then open `7. 深度技法書庫`, click `Build Technique Book From Reference Shelf`, search for terms such as `眼睛`, `嘴巴`, `手`, `腰身`, `喝酒`, or choose a category like `動作描寫 / 喝酒飲茶描寫`, then click `Load Search Results To Writing AGENT`.
+
+To feed chapter-craft analysis back into the writing AGENT, open `9. 技法回灌與檢閱 Skill / Technique Review`, use `full_report.md -> Compact Technique Library -> Writing AGENT`, distill the report, then click `Load Distilled Library To Writing AGENT`. The app writes the compact library to the `Technique Library` reference field and can append memory/director instructions for the next generation.
+
+Model routing can be changed from the frontend in `1. 設定 Core Settings`:
+
+- Edit Writing / NALANG Base URL, Model, and API key.
+- Edit Analysis / Grok Base URL, Model, and API key.
+- Edit LoRA Base URL and Model.
+- Use `Save Model Config` and `Load Model Config` to persist these settings in `book_output/model_config.json`.
+
+## Output Structure
+
+Generated content is saved in the `book_output` directory:
+```
+book_output/
+├── outline.txt
+├── chapter_01.txt
+├── chapter_02.txt
+└── ...
 ```
 
-分享前請確認 exe 沒有打包 `.env` 或個人資料。
+## Requirements
 
-## 常見問題
+- Python 3.8+
+- AutoGen 0.2.0+
+- Other dependencies listed in requirements.txt
 
-### 啟動時找不到 Python
+## Development
 
-安裝 Python，並勾選 `Add python.exe to PATH`。Windows 也可改用 `py -m venv .venv` 建立環境。
+To contribute to the project:
 
-### Gradio 安裝失敗
+1. Fork the repository
+2. Create a new branch for your feature
+3. Install development dependencies:
+```bash
+pip install -r requirements.txt
+```
+4. Make your changes
+5. Run tests:
+```bash
+pytest
+```
+6. Submit a pull request
 
-先更新 pip：
+## Error Handling
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+The system includes robust error handling:
+- Validates chapter completeness
+- Ensures proper formatting
+- Maintains backup copies of generated content
+- Implements retry logic for failed generations
+
+## Limitations
+
+- Requires significant computational resources
+- Generation time increases with chapter count
+- Quality depends on the underlying LLM model
+- May require manual review for final polish
+
+## Legacy AutoGen pipeline
+
+The original multi-agent book generator (built on
+[AutoGen](https://github.com/microsoft/autogen)) is still included and usable.
+It composes specialized agents — Story Planner, World Builder, Memory Keeper,
+Writer, Editor, and Outline Creator — to generate a structured book from a
+prompt. Example:
+
+```python
+from config import get_config
+from agents import BookAgents
+from book_generator import BookGenerator
+from outline_generator import OutlineGenerator
+
+agent_config = get_config()
+
+outline_agents = BookAgents(agent_config)
+agents = outline_agents.create_agents()
+
+outline_gen = OutlineGenerator(agents, agent_config)
+outline = outline_gen.generate_outline(your_prompt, num_chapters=25)
+
+book_agents = BookAgents(agent_config, outline)
+agents_with_context = book_agents.create_agents()
+book_gen = BookGenerator(agents_with_context, agent_config, outline)
+book_gen.generate_book(outline)
 ```
 
-### 外部 API 回傳 502
+The `autogen` dependency in `requirements.txt` exists for this pipeline.
 
-先檢查 `.env` 裡的 `OPENAI_API_KEY` 或 `LLM_API_KEY` 是否存在，再檢查 `OPENAI_BASE_URL` 與 `UPSTREAM_OPENAI_BASE_URL`。
+## Contributing
 
-### Grok 分析不能用
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-檢查 `XAI_API_KEY`、`XAI_BASE_URL`、`XAI_MODEL`，也可以先在 Studio 的 `Test Analysis Grok` 測試。
+Development tools (pytest, black, flake8, mypy) are listed under the optional
+section of `requirements.txt`; install them only if you intend to lint/test.
 
-### LoRA 服務不能連
+## License
 
-先啟動 `start_lora_server.bat`，確認 `/health` 可回應，再回到 Studio 讀取 LoRA。
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-### 中文檔案亂碼
+## Acknowledgments
 
-專案預設以 UTF-8/UTF-8-SIG 讀寫，舊檔若是 GB18030 或 Big5，建議先轉成 UTF-8。
-
-## 分享前檢查
-
-這份乾淨副本已移除：
-
-- `.env` 與所有實際 API key。
-- `.venv`、cache、`__pycache__`。
-- `book_output`、改寫輸出、診斷報告與生成稿。
-- 個人小說稿、訓練語料、訓練資料集。
-- LoRA checkpoint、模型權重、訓練 runs。
-- build/dist、exe、PyInstaller spec。
-- 本機使用者路徑範例。
-
-分享或上傳前仍建議再跑：
-
-```powershell
-rg -n --hidden "sk-[A-Za-z0-9_-]{20,}|xai-[A-Za-z0-9_-]{20,}|<your-user-name>|<private-project-name>" .
-rg -n --hidden "OPENAI_API_KEY|XAI_API_KEY|LLM_API_KEY" .
-```
-
-只要結果沒有真實 key、個人路徑或私人內容，就可以交付。
+- Built using the [AutoGen](https://github.com/microsoft/autogen) framework
+- Inspired by collaborative writing systems

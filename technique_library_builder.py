@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from glob import glob
 from dataclasses import asdict, dataclass
@@ -15,6 +16,9 @@ from openai import OpenAI
 from chapter_craft_skill import to_positive_int, trim_preview
 from report_technique_distiller import TECHNIQUE_LOAD_MODES, merge_text_field
 from skill_technique_review import read_text, sanitize_review_text, trim_text
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_BOOK_LIBRARY_GOAL = (
@@ -576,6 +580,16 @@ def build_integrated_technique_book_library(
         return f"[ERROR] {exc}", "", None, None, ""
 
 
+def _is_local_service_url(url: str) -> bool:
+    """Heuristically decide whether a Base URL points at a local OpenAI-compatible
+    service (localhost / loopback) that typically does not require an API key."""
+    lowered = (url or "").strip().lower()
+    if not lowered:
+        return False
+    local_markers = ("localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal")
+    return any(marker in lowered for marker in local_markers)
+
+
 def build_library_from_documents(
     *,
     docs: list[SourceDocument],
@@ -599,6 +613,16 @@ def build_library_from_documents(
         else:
             if not analysis_base_url.strip() or not analysis_model_name.strip():
                 return "[ERROR] 請先設定 Analysis / Grok 的 Base URL 與 Model Name。", "", None, None, ""
+            # A remote (non-local) endpoint almost always needs auth; surface the
+            # missing-key problem here instead of letting it fail deep in the API call.
+            if not _is_local_service_url(analysis_base_url.strip()) and not (analysis_api_key or "").strip():
+                return (
+                    "[ERROR] Analysis Base URL 看起來是遠端服務，請提供 API Key。",
+                    "",
+                    None,
+                    None,
+                    "",
+                )
             client = OpenAI(
                 api_key=(analysis_api_key or "not-needed").strip(),
                 base_url=analysis_base_url.strip().rstrip("/"),
@@ -943,7 +967,8 @@ def read_any_source(path: Path) -> str:
         try:
             payload = json.loads(read_text(path))
             return flatten_json_source(payload)
-        except Exception:
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
+            logger.warning("Failed to parse JSON source %s, reading as plain text: %s", path, exc)
             return read_text(path)
     return read_text(path)
 
@@ -1786,9 +1811,10 @@ def ask_grok_for_book_entries(
 ) -> list[TechniqueBookEntry]:
     source_pack = build_source_pack(docs)
     taxonomy_text = render_taxonomy_for_prompt()
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
             {
                 "role": "system",
                 "content": (
@@ -1849,10 +1875,19 @@ def ask_grok_for_book_entries(
                     f"{source_pack}"
                 ),
             },
-        ],
-        temperature=0.3,
-        max_tokens=8000,
-    )
+            ],
+            temperature=0.3,
+            max_tokens=8000,
+        )
+    except TimeoutError as exc:
+        # OpenAI raises APITimeoutError (a TimeoutError subclass) when the call
+        # exceeds the client timeout. Fall back to the local categorizer rather
+        # than letting the request hang or crash the build.
+        logger.warning("Grok technique extraction timed out: %s", exc)
+        return []
+    except Exception as exc:  # noqa: BLE001 - network/API errors must not crash the build
+        logger.warning("Grok technique extraction failed: %s", exc)
+        return []
     raw = (response.choices[0].message.content or "").strip()
     mappings = parse_json_array(raw)
     entries: list[TechniqueBookEntry] = []
@@ -1888,22 +1923,65 @@ def render_taxonomy_for_prompt() -> str:
     return "\n".join(lines)
 
 
+def _strip_markdown_fences(text: str) -> str:
+    """Remove a leading ```json / ``` fence and any trailing fence."""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        # Drop the opening fence line (e.g. ```json) and the closing fence.
+        stripped = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped).strip()
+    return stripped
+
+
+def _coerce_json_list(data: Any) -> list[dict[str, Any]] | None:
+    """Return the list-of-dicts payload if `data` is usable, else None."""
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    # Some models wrap the array in an object, e.g. {"entries": [...]}.
+    if isinstance(data, dict):
+        for key in ("entries", "cards", "items", "data", "results"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return None
+
+
 def parse_json_array(raw: str) -> list[dict[str, Any]]:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
+    """Extract a JSON array of technique mappings from a model response.
+
+    Tries several strategies (fence stripping, bracket extraction, raw parse)
+    before giving up, to avoid silently dropping otherwise-valid output. Returns
+    an empty list only when no strategy yields a list of dicts.
+    """
+    text = _strip_markdown_fences(raw or "")
+    if not text:
+        return []
+
+    candidates: list[str] = []
+    # Strategy 1: balanced bracket extraction (first '[' .. last ']').
     start = text.find("[")
     end = text.rfind("]")
     if start >= 0 and end > start:
-        text = text[start : end + 1]
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return []
-    if isinstance(data, list):
-        return [item for item in data if isinstance(item, dict)]
+        candidates.append(text[start : end + 1])
+    # Strategy 2: the full (fence-stripped) text, in case it is a bare object.
+    candidates.append(text)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            data = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.debug("parse_json_array: candidate failed to parse: %s", exc)
+            continue
+        coerced = _coerce_json_list(data)
+        if coerced is not None:
+            return coerced
+
+    logger.warning("parse_json_array: no valid JSON array found in model response.")
     return []
 
 
@@ -2141,9 +2219,14 @@ def load_library_payload(library_state_json: str, library_json_path: str) -> dic
         path = Path(clean_path).expanduser()
         if not path.is_absolute():
             path = Path.cwd() / path
-        if not path.is_file():
-            raise ValueError(f"找不到書庫 JSON：{path}")
-        return json.loads(path.read_text(encoding="utf-8"))
+        # Guard against path traversal: only allow reads inside the project tree.
+        resolved = path.resolve()
+        cwd = Path.cwd().resolve()
+        if cwd != resolved and cwd not in resolved.parents:
+            raise ValueError(f"書庫 JSON 路徑必須在專案目錄內：{resolved}")
+        if not resolved.is_file():
+            raise ValueError(f"找不到書庫 JSON：{resolved}")
+        return json.loads(resolved.read_text(encoding="utf-8"))
     latest = find_latest_book_library_json()
     if latest is None:
         raise ValueError("找不到已建立的 Integrated Technique Book Library。")
@@ -2289,6 +2372,38 @@ def clip_text(text: str, max_chars: int) -> str:
 # surface the matching "how to write it" technique template for review.
 # ---------------------------------------------------------------------------
 
+def _count_subcategory_hits(compact: str, terms: list[str]) -> tuple[int, list[str]]:
+    """Count keyword/alias hits without inflating via overlapping substrings.
+
+    Chinese is not space-delimited, so a short term like "眼" would otherwise be
+    recounted inside every longer term that contains it (e.g. "眼神", "眼尾").
+    We match longer terms first and mask the spans they consume, so a shorter
+    term only scores against text not already attributed to a longer term.
+    """
+    if not compact:
+        return 0, []
+    # A simple mutable list of chars used as an occupancy mask.
+    consumed = [False] * len(compact)
+    count = 0
+    matched: list[str] = []
+    for term in sorted(terms, key=len, reverse=True):
+        if not term:
+            continue
+        term_hits = 0
+        for match in re.finditer(re.escape(term), compact):
+            start, end = match.start(), match.end()
+            if any(consumed[start:end]):
+                continue  # overlaps a span already claimed by a longer term
+            for i in range(start, end):
+                consumed[i] = True
+            term_hits += 1
+        if term_hits:
+            count += term_hits
+            if term not in matched:
+                matched.append(term)
+    return count, matched
+
+
 def detect_active_subcategories(text: str, max_topics: int = 4) -> list[tuple[int, str, dict[str, Any], list[str]]]:
     """Score TAXONOMY subcategories by how strongly their trigger words appear in `text`.
 
@@ -2301,17 +2416,8 @@ def detect_active_subcategories(text: str, max_topics: int = 4) -> list[tuple[in
     scored: list[tuple[int, str, dict[str, Any], list[str]]] = []
     for category in TAXONOMY:
         for sub in category["subcategories"]:
-            count = 0
-            matched: list[str] = []
-            for term in list(sub.get("keywords", [])) + list(sub.get("aliases", [])):
-                term = str(term)
-                if not term:
-                    continue
-                occ = compact.count(term)
-                if occ:
-                    count += occ
-                    if term not in matched:
-                        matched.append(term)
+            terms = [str(t) for t in (list(sub.get("keywords", [])) + list(sub.get("aliases", []))) if str(t)]
+            count, matched = _count_subcategory_hits(compact, terms)
             if count > 0:
                 scored.append((count, category["category"], sub, matched))
     scored.sort(key=lambda item: (-item[0], item[1], item[2]["name"]))
@@ -2384,7 +2490,8 @@ def suggest_technique_templates(
     try:
         payload = load_library_payload(library_state_json, library_json_path)
         library_entries = entries_from_payload(payload)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - fall back to built-in taxonomy, but log why
+        logger.warning("Failed to load technique library, using built-in taxonomy: %s", exc)
         library_entries = []
     source_note = "目前技法書庫" if library_entries else "內建技法 taxonomy（建一次深度技法書庫後會更貼合你的參考小說）"
     topics_line = "、".join(f"{cat}/{sub['name']}({count})" for count, cat, sub, _ in detected)

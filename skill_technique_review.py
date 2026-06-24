@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 REVIEW_CHOICES = [
@@ -236,12 +239,30 @@ def read_custom_artifact(custom_path: str) -> ReviewArtifact | None:
     clean = (custom_path or "").strip().strip('"')
     if not clean:
         return None
-    path = Path(clean).expanduser()
-    if not path.is_absolute():
-        path = Path.cwd() / path
+    raw = Path(clean).expanduser()
+    if not raw.is_absolute():
+        raw = Path.cwd() / raw
+    # Resolve symlinks / '..' segments so a relative input cannot traverse out of
+    # the project (e.g. '../../etc/passwd') while still allowing intentional
+    # absolute paths the operator chooses.
+    path = raw.resolve()
+    cwd = Path.cwd().resolve()
+    home = Path.home().resolve()
+    if not (is_within(path, cwd) or is_within(path, home)):
+        logger.warning("Rejected custom artifact path outside allowed roots: %s", path)
+        raise ValueError(f"Custom path is outside the allowed directories: {path}")
     if not path.is_file():
         raise ValueError(f"Custom path does not exist: {path}")
     return ReviewArtifact("Custom Markdown / JSON Path", path, read_text(path))
+
+
+def is_within(path: Path, root: Path) -> bool:
+    """Return True if resolved ``path`` is ``root`` or lives beneath it."""
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def read_text(path: Path) -> str:
@@ -252,6 +273,9 @@ def read_text(path: Path) -> str:
             return path.read_text(encoding=encoding, errors="strict")
         except UnicodeDecodeError:
             continue
+    # No known encoding matched: decode lossily so the UI still works, but warn
+    # because multi-byte (e.g. Chinese) text may be corrupted by replacements.
+    logger.warning("No clean encoding for %s; falling back to utf-8 with replacement characters.", path)
     return path.read_text(encoding="utf-8", errors="replace")
 
 
@@ -293,7 +317,7 @@ def extract_director_blocks(text: str, limit: int) -> list[str]:
     return blocks
 
 
-def extract_deep_technique_blocks(text: str, limit: int) -> list[str]:
+def extract_deep_technique_blocks(text: str, limit: int, follow_lines: int = 8) -> list[str]:
     blocks: list[str] = []
     headings = (
         "Anatomy Breakdown",
@@ -307,10 +331,11 @@ def extract_deep_technique_blocks(text: str, limit: int) -> list[str]:
         "Common Mistakes",
         "Practice Prompts",
     )
+    # Build the alternation from the headings tuple so the list lives in one place.
+    heading_alt = "|".join(re.escape(heading) for heading in headings)
     pattern = re.compile(
-        r"(?im)^(?:\*\*)?(Anatomy Breakdown|Sentence Rhythm|Word Palette|Sensory Layering|Weak vs Strong|"
-        r"Deep Breakdown|Detail Lenses|Micro Techniques|Common Mistakes|Practice Prompts)(?:\*\*)?.*$"
-        r"(?:\n(?:[-*].*|.{1,260})){0,8}"
+        rf"(?im)^(?:\*\*)?({heading_alt})(?:\*\*)?.*$"
+        rf"(?:\n(?:[-*].*|.{{1,260}})){{0,{follow_lines}}}"
     )
     for match in pattern.finditer(text):
         title = match.group(1)
@@ -326,6 +351,22 @@ def extract_deep_technique_blocks(text: str, limit: int) -> list[str]:
 
 def sanitize_review_text(text: str) -> str:
     return "\n".join(sanitize_line(line) for line in text.splitlines())
+
+
+def drop_unsafe_lines(text: str, markers: list[str]) -> str:
+    """Sanitize then drop any line containing one of the given unsafe markers.
+
+    Shared helper so report_technique_distiller and this module use a single
+    line-filtering implementation instead of duplicating the loop.
+    """
+    lowered = [marker.lower() for marker in markers]
+    kept = []
+    for line in sanitize_review_text(text).splitlines():
+        low = line.lower()
+        if any(marker in low for marker in lowered):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def sanitize_line(line: str) -> str:
@@ -411,11 +452,15 @@ def mark_exists(path: Path) -> str:
     return "OK" if path.exists() else "MISSING"
 
 
-def to_positive_int(value: float | int | None) -> int | None:
+def to_positive_int(value: float | int | None, maximum: int = 2_000_000) -> int | None:
     if value is None:
         return None
     try:
         number = int(value)
     except (TypeError, ValueError):
         return None
-    return number if number > 0 else None
+    if number <= 0:
+        return None
+    # Clamp to a generous ceiling so an accidental/huge char limit cannot trigger
+    # multi-megabyte string allocations downstream. Well above any realistic UI input.
+    return min(number, maximum)

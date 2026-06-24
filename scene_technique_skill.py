@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -10,13 +11,21 @@ from typing import Any
 from openai import OpenAI
 
 from chapter_craft_skill import (
+    API_TIMEOUT,
     Chapter,
+    chat_complete,
+    language_instruction,
     load_chapters,
     normalize_text,
+    read_message,
     to_positive_int,
     trim_chapter_text,
     trim_preview,
+    write_text_with_backup,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_TECHNIQUE_GOAL = (
@@ -110,7 +119,7 @@ def aggregate_scene_techniques(
             client = OpenAI(
                 api_key=(analysis_api_key or "not-needed").strip(),
                 base_url=analysis_base_url.strip().rstrip("/"),
-                timeout=900,
+                timeout=API_TIMEOUT,
             )
             report = ask_scene_technique_agent(
                 client=client,
@@ -181,7 +190,7 @@ def distill_novel_to_technique_finder(
             client = OpenAI(
                 api_key=(analysis_api_key or "not-needed").strip(),
                 base_url=analysis_base_url.strip().rstrip("/"),
-                timeout=900,
+                timeout=API_TIMEOUT,
             )
             cards = []
             for chapter in chapters:
@@ -227,7 +236,9 @@ def ask_scene_technique_agent(
     max_chars: int,
 ) -> str:
     reference = build_reference_excerpt(chapters, max_chars)
-    response = client.chat.completions.create(
+    return chat_complete(
+        client,
+        label="場景手法彙整",
         model=model_name,
         messages=[
             {
@@ -271,7 +282,6 @@ def ask_scene_technique_agent(
         temperature=0.35,
         max_tokens=2600,
     )
-    return (response.choices[0].message.content or "").strip()
 
 
 def ask_chapter_technique_cards(
@@ -285,7 +295,7 @@ def ask_chapter_technique_cards(
     max_chars: int,
 ) -> list[TechniqueCard]:
     chapter_text = trim_chapter_text(chapter.text, max_chars)
-    response = client.chat.completions.create(
+    create_kwargs: dict[str, Any] = dict(
         model=model_name,
         messages=[
             {
@@ -322,7 +332,27 @@ def ask_chapter_technique_cards(
         temperature=0.25,
         max_tokens=4000,
     )
-    raw = (response.choices[0].message.content or "").strip()
+    try:
+        response = client.chat.completions.create(**create_kwargs)
+    except Exception as exc:
+        logger.error("第 %s 章卡片抽取呼叫失敗：%s", chapter.index, exc)
+        raise RuntimeError(f"卡片抽取呼叫失敗：{exc}") from exc
+    # Warn if the model may have hit the token ceiling and truncated the JSON.
+    usage = getattr(response, "usage", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if isinstance(completion_tokens, int) and completion_tokens >= 3900:
+        logger.warning(
+            "第 %s 章卡片抽取接近 token 上限（%s/4000），JSON 可能被截斷。",
+            chapter.index,
+            completion_tokens,
+        )
+    raw = read_message(response)
+    if raw and not raw.rstrip().endswith("]"):
+        logger.warning(
+            "第 %s 章卡片 JSON 可能被截斷（結尾：%r）。",
+            chapter.index,
+            raw[-10:],
+        )
     parsed = parse_card_json(raw)
     if parsed:
         return [card_from_mapping(item, chapter) for item in parsed[:cards_per_chapter]]
@@ -380,9 +410,9 @@ def write_technique_report(
         },
         "report": report,
     }
-    (output_dir / "scene_techniques.json").write_text(
+    write_text_with_backup(
+        output_dir / "scene_techniques.json",
         json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
     markdown = (
         "# 特定場景 / 動作 / 情境描寫手法\n\n"
@@ -397,7 +427,7 @@ def write_technique_report(
         "## 手法彙整\n\n"
         f"{report}\n"
     )
-    (output_dir / "scene_techniques.md").write_text(markdown, encoding="utf-8")
+    write_text_with_backup(output_dir / "scene_techniques.md", markdown)
     return output_dir
 
 
@@ -418,12 +448,12 @@ def write_technique_library(
         "mode": mode,
         "cards": [card.__dict__ for card in cards],
     }
-    (output_dir / "technique_finder_library.json").write_text(
+    write_text_with_backup(
+        output_dir / "technique_finder_library.json",
         json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
     markdown = render_technique_library(source_label, goal, mode, cards)
-    (output_dir / "technique_finder_library.md").write_text(markdown, encoding="utf-8")
+    write_text_with_backup(output_dir / "technique_finder_library.md", markdown)
     return output_dir
 
 
@@ -559,7 +589,8 @@ def parse_card_json(raw: str) -> list[dict[str, Any]]:
         text = text[start : end + 1]
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        logger.warning("無法解析卡片 JSON：%s（原始長度：%d）", exc, len(raw))
         return []
     if isinstance(data, list):
         return [item for item in data if isinstance(item, dict)]
@@ -590,14 +621,3 @@ def card_from_mapping(item: dict[str, Any], chapter: Chapter) -> TechniqueCard:
         formulas=[str(formula).strip() for formula in formulas if str(formula).strip()],
         director_instruction=str(item.get("director_instruction") or "").strip(),
     )
-
-
-def language_instruction(output_language: str) -> str:
-    mapping = {
-        "繁体中文": "請使用繁體中文。",
-        "繁體中文": "請使用繁體中文。",
-        "简体中文": "请使用简体中文。",
-        "English": "Use English.",
-        "日本語": "日本語で出力してください。",
-    }
-    return mapping.get(output_language or "", "請使用繁體中文。")

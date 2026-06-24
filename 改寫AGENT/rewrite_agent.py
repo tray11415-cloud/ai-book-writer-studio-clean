@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import socket
 import sys
@@ -28,10 +29,12 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, ClassVar, Iterable
 
 from openai import OpenAI
 
+
+logger = logging.getLogger(__name__)
 
 AGENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = AGENT_DIR.parent
@@ -46,6 +49,15 @@ from compat_proxy import PORT as PROXY_PORT  # noqa: E402
 from compat_proxy import main as run_compat_proxy  # noqa: E402
 from config import get_config  # noqa: E402
 from lora_runtime import LORA_BASE_URL, LORA_MODEL_NAME, ensure_lora_server_running, is_lora_base_url  # noqa: E402
+
+# Cross-chunk anti-repetition. The module sits at the repo root (already added to
+# sys.path above) and depends only on the stdlib, so the import is safe; if it is
+# ever unavailable we degrade gracefully rather than break the rewrite engine.
+try:
+    import repetition_guard  # noqa: E402
+except Exception as exc:  # noqa: BLE001 - optional enhancement, never fatal.
+    repetition_guard = None  # type: ignore[assignment]
+    logger.warning("repetition_guard unavailable, cross-chunk dedup disabled: %s", exc)
 
 
 MODE_API = "外部 API"
@@ -100,9 +112,25 @@ LORA_EXPAND_MAX_TOKENS = 1400
 
 DEFAULT_CFG = get_config()
 DEFAULT_LLM = DEFAULT_CFG["config_list"][0]
+# Non-secret defaults are fine to keep at module scope. The API key is NOT baked
+# in as a dataclass default or CLI default any more: it is resolved lazily from the
+# environment / config only when a client is actually built (see resolve_api_key).
+# DEFAULT_API_KEY remains exported because the Gradio UI (改寫AGENT/app.py) reads it
+# to pre-fill the key field; it is just no longer used as a default argument value.
 DEFAULT_API_KEY = DEFAULT_LLM["api_key"]
 DEFAULT_BASE_URL = DEFAULT_LLM["base_url"]
 DEFAULT_MODEL = DEFAULT_LLM["model"]
+
+
+def resolve_api_key(explicit: str = "") -> str:
+    """Return the API key to use, preferring an explicit override.
+
+    Reads from the live config/env on each call instead of holding the secret in
+    a long-lived module constant, so the key is only materialized when needed.
+    """
+    if explicit and explicit.strip():
+        return explicit.strip()
+    return get_config()["config_list"][0].get("api_key", "") or ""
 
 
 @dataclass
@@ -112,7 +140,9 @@ class RewriteSettings:
     rewrite_strength: str = "強改寫"
     operation: str = OP_REWRITE
     output_language: str = "繁體中文"
-    api_key: str = DEFAULT_API_KEY
+    # Empty by default: the key is resolved from env/config at client-build time
+    # (resolve_api_key) rather than baked into the dataclass as a secret default.
+    api_key: str = ""
     api_base_url: str = DEFAULT_BASE_URL
     api_model: str = DEFAULT_MODEL
     chunk_chars: int = 900
@@ -175,10 +205,21 @@ class NarrativeSpine:
     "what the next chapter must continue" note — the continuity system's bridge.
     """
 
+    # Only the most recent beats are ever rendered, so the list is also bounded to
+    # this length on append (see add_beat) to keep memory and context size flat for
+    # very long (hundreds-of-chapter) manuscripts.
+    MAX_BEATS: ClassVar[int] = 12
+
     bible: str = ""
     chapter_beats: list[str] = field(default_factory=list)
     handoff: str = ""
     updates: int = 0
+
+    def add_beat(self, beat: str) -> None:
+        """Append a chapter beat, keeping the list bounded to MAX_BEATS."""
+        self.chapter_beats.append(beat)
+        if len(self.chapter_beats) > self.MAX_BEATS:
+            del self.chapter_beats[: len(self.chapter_beats) - self.MAX_BEATS]
 
     def render(self) -> str:
         if not (self.bible.strip() or self.chapter_beats or self.handoff.strip()):
@@ -187,7 +228,10 @@ class NarrativeSpine:
         if self.bible.strip():
             parts.append(self.bible.strip())
         if self.chapter_beats:
-            parts.append("各章脈絡：\n" + "\n".join(self.chapter_beats[-12:]))
+            # Cap the rendered beats block so a long backbone can never balloon the
+            # injected context past the model's window.
+            beats_text = "\n".join(self.chapter_beats[-self.MAX_BEATS:])[:1200]
+            parts.append("各章脈絡：\n" + beats_text)
         if self.handoff.strip():
             parts.append("接續要點（下一段／下一章必須延續或回應）：\n" + self.handoff.strip())
         return "\n".join(parts)
@@ -835,14 +879,28 @@ def split_text(text: str, max_chars: int) -> list[str]:
         return []
 
     max_chars = max(600, int(max_chars))
-    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", normalized) if part.strip()]
-    units: list[str] = []
-    for paragraph in paragraphs:
-        units.extend(split_long_paragraph(paragraph, max_chars))
+    # Split into "scene segments" first: a run of 3+ newlines marks a deliberate
+    # scene break, which we treat as a hard chunk boundary so the structural cue is
+    # never silently merged into the middle of a chunk. Within a scene, paragraphs
+    # are split on ordinary blank lines as before.
+    scene_segments = re.split(r"\n{3,}", normalized)
+    # (unit_text, starts_scene): the flag is True for the first unit after a scene
+    # break, telling the packer to flush the current chunk at that boundary.
+    units: list[tuple[str, bool]] = []
+    for seg_index, segment in enumerate(scene_segments):
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", segment) if part.strip()]
+        for para_index, paragraph in enumerate(paragraphs):
+            for sub_index, piece in enumerate(split_long_paragraph(paragraph, max_chars)):
+                starts_scene = seg_index > 0 and para_index == 0 and sub_index == 0
+                units.append((piece, starts_scene))
 
     chunks: list[str] = []
     buffer = ""
-    for unit in units:
+    for unit, starts_scene in units:
+        # A scene break flushes the current chunk so it does not straddle the break.
+        if starts_scene and buffer:
+            chunks.append(buffer)
+            buffer = ""
         candidate = (buffer + "\n\n" + unit).strip() if buffer else unit
         if len(candidate) <= max_chars:
             buffer = candidate
@@ -972,6 +1030,58 @@ def api_extra_body(settings: RewriteSettings) -> dict[str, object] | None:
     return None
 
 
+def _create_completion(
+    *,
+    client: OpenAI,
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    extra_body: dict[str, object] | None,
+    retries: int,
+):
+    """Call chat.completions.create with retry + transient-error backoff.
+
+    Shared by the main request and the length-continuation request so both get
+    identical retry semantics instead of the continuation call being unguarded.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                stream=False,  # DZMM defaults to SSE when omitted; force a JSON body.
+                extra_body=extra_body,
+            )
+        except Exception as exc:  # noqa: BLE001 - re-raised unless transient + retries left.
+            last_exc = exc
+            if attempt >= retries or not is_transient_api_error(exc):
+                raise
+            time.sleep(3 * (attempt + 1))
+    # Unreachable in practice (the loop returns or raises), but keep a definite
+    # error so the function never falls through to return None.
+    raise last_exc or RuntimeError("Model request failed.")
+
+
+def _response_content(response) -> tuple[str, str | None]:
+    """Safely pull (content, finish_reason) out of a completion response."""
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise ValueError("Model response contained no choices.")
+    choice = choices[0]
+    if choice is None:
+        raise ValueError("Model response choice was empty.")
+    message = getattr(choice, "message", None)
+    content = (getattr(message, "content", None) or "") if message is not None else ""
+    finish_reason = getattr(choice, "finish_reason", None)
+    return content.strip(), finish_reason
+
+
 def chat_text(
     *,
     client: OpenAI,
@@ -984,28 +1094,23 @@ def chat_text(
     continue_on_length: bool = False,
     extra_body: dict[str, object] | None = None,
 ) -> str:
-    last_exc: Exception | None = None
-    for attempt in range(retries + 1):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=settings.temperature if temperature is None else temperature,
-                top_p=settings.top_p,
-                max_tokens=max_tokens or settings.max_tokens,
-                stream=False,  # DZMM defaults to SSE when omitted; force a JSON body.
-                extra_body=extra_body,
-            )
-            break
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if attempt >= retries or not is_transient_api_error(exc):
-                raise
-            time.sleep(3 * (attempt + 1))
-    else:
-        raise last_exc or RuntimeError("Model request failed.")
-    content = (response.choices[0].message.content or "").strip()
-    finish_reason = getattr(response.choices[0], "finish_reason", None)
+    resolved_temperature = settings.temperature if temperature is None else temperature
+    resolved_max_tokens = max_tokens or settings.max_tokens
+    response = _create_completion(
+        client=client,
+        model=model,
+        messages=messages,
+        temperature=resolved_temperature,
+        top_p=settings.top_p,
+        max_tokens=resolved_max_tokens,
+        extra_body=extra_body,
+        retries=retries,
+    )
+    content, finish_reason = _response_content(response)
+    if not content:
+        # An empty body would silently drop a chunk / digest downstream; surface it
+        # so callers (which catch and fall back) can react instead of producing a gap.
+        raise ValueError(f"Model returned empty content (finish_reason={finish_reason}).")
 
     if continue_on_length and content and (finish_reason == "length" or looks_truncated(content)):
         continuation_messages = messages + [
@@ -1019,16 +1124,17 @@ def chat_text(
             },
         ]
         try:
-            continuation = client.chat.completions.create(
+            continuation = _create_completion(
+                client=client,
                 model=model,
                 messages=continuation_messages,
-                temperature=settings.temperature if temperature is None else temperature,
+                temperature=resolved_temperature,
                 top_p=settings.top_p,
-                max_tokens=min(max_tokens or settings.max_tokens, 400),
-                stream=False,
+                max_tokens=min(resolved_max_tokens, 400),
                 extra_body=extra_body,
+                retries=retries,
             )
-            extra = (continuation.choices[0].message.content or "").strip()
+            extra, _ = _response_content(continuation)
             extra, _ = clean_model_output(extra)
             if extra:
                 # The continuation often re-emits the truncated tail before
@@ -1038,8 +1144,8 @@ def chat_text(
                 if extra:
                     separator = "" if overlap else "\n"
                     content = normalize_blank_lines(content + separator + extra)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - fall back to the truncated body.
+            logger.warning("Continuation request failed: %s", exc)
     return content
 
 
@@ -1327,8 +1433,8 @@ def update_story_context(
         if digest:
             story.digest = digest[:1600]
             story.updates += 1
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001 - best-effort digest refresh, never fatal.
+        logger.error("Story context update failed: %s", exc, exc_info=True)
 
 
 _SPINE_SECTION_RE = re.compile(r"【\s*(全書骨幹|本章一句話|接續要點)\s*】")
@@ -1414,13 +1520,17 @@ def update_narrative_spine(
         )
         bible, beat, handoff = _parse_spine_output(out)
         if bible:
+            if len(bible) > 2200:
+                logger.warning("Spine bible truncated from %d to 2200 chars", len(bible))
             spine.bible = bible[:2200]
         if beat:
-            spine.chapter_beats.append(f"第{chapter_index + 1}章：{beat}")
+            spine.add_beat(f"第{chapter_index + 1}章：{beat}")
+        if len(handoff) > 900:
+            logger.warning("Spine handoff truncated from %d to 900 chars", len(handoff))
         spine.handoff = handoff[:900]
         spine.updates += 1
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001 - best-effort backbone refresh, never fatal.
+        logger.error("Narrative spine update failed: %s", exc, exc_info=True)
 
 
 def rewrite_chunk(
@@ -1434,7 +1544,24 @@ def rewrite_chunk(
     previous_tail: str,
     story_context: str = "",
 ) -> tuple[str, dict[str, object]]:
-    info: dict[str, object] = {"mode": settings.mode, "operation": settings.operation}
+    info: dict[str, object] = {
+        "mode": settings.mode,
+        "operation": settings.operation,
+        # Always present so every chunk log entry has a uniform shape, even when
+        # the spine does not refresh on this chunk (or its refresh fails).
+        "spine_updates": 0,
+    }
+
+    def finalize(text: str, *, text_key: str, cleanup_key: str) -> str:
+        """Clean a candidate, record the result + stats in ``info``, return text.
+
+        Centralizes the clean-and-log step the four mode paths share; the caller
+        keeps its own return / control flow, so semantics are unchanged.
+        """
+        cleaned, cleanup = clean_rewrite_candidate(text, previous_tail)
+        info[text_key] = cleaned
+        info[cleanup_key] = cleanup
+        return cleaned
 
     if settings.mode == MODE_LORA:
         if lora_client is None:
@@ -1448,9 +1575,7 @@ def rewrite_chunk(
             previous_tail=previous_tail,
             story_context=story_context,
         )
-        rewritten, cleanup = clean_rewrite_candidate(rewritten, previous_tail)
-        info["draft"] = rewritten
-        info["cleanup"] = cleanup
+        rewritten = finalize(rewritten, text_key="draft", cleanup_key="cleanup")
         return rewritten, info
 
     if settings.mode == MODE_API:
@@ -1465,9 +1590,7 @@ def rewrite_chunk(
             previous_tail=previous_tail,
             story_context=story_context,
         )
-        rewritten, cleanup = clean_rewrite_candidate(rewritten, previous_tail)
-        info["draft"] = rewritten
-        info["cleanup"] = cleanup
+        rewritten = finalize(rewritten, text_key="draft", cleanup_key="cleanup")
         return rewritten, info
 
     if api_client is None or lora_client is None:
@@ -1486,7 +1609,8 @@ def rewrite_chunk(
                 story_context=story_context,
             )
             info["plan"] = plan
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - planning is optional; fall back to no plan.
+            logger.error("Plan generation failed: %s", exc, exc_info=True)
             info["plan_error"] = str(exc)
             plan = ""
 
@@ -1500,9 +1624,7 @@ def rewrite_chunk(
         story_context=story_context,
         plan=plan,
     )
-    draft, draft_cleanup = clean_rewrite_candidate(draft, previous_tail)
-    info["draft"] = draft
-    info["draft_cleanup"] = draft_cleanup
+    draft = finalize(draft, text_key="draft", cleanup_key="draft_cleanup")
     try:
         final = polish_with_api(
             api_client=api_client,
@@ -1514,13 +1636,12 @@ def rewrite_chunk(
             previous_tail=previous_tail,
             story_context=story_context,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - degrade to the LoRA draft on polish failure.
+        logger.error("Polish API call failed: %s", exc, exc_info=True)
         info["polish_error"] = str(exc)
         info["fallback"] = "Used local LoRA draft because external API polish failed."
         return draft, info
-    final, final_cleanup = clean_rewrite_candidate(final, previous_tail)
-    info["final"] = final
-    info["final_cleanup"] = final_cleanup
+    final = finalize(final, text_key="final", cleanup_key="final_cleanup")
     return final or draft, info
 
 
@@ -1538,7 +1659,7 @@ def full_rewrite(
     api_client = None
     lora_client = None
     if settings.mode in {MODE_API, MODE_HYBRID, MODE_FULL_HYBRID}:
-        api_client = get_client(settings.api_key, settings.api_base_url)
+        api_client = get_client(resolve_api_key(settings.api_key), settings.api_base_url)
     if settings.mode in {MODE_LORA, MODE_HYBRID, MODE_FULL_HYBRID}:
         lora_client = get_client("not-needed", LORA_BASE_URL)
 
@@ -1604,20 +1725,43 @@ def full_rewrite(
             part for part in [diagnosis_block, spine.render(), chapter_label, story.render()] if part
         )
 
+        # Cross-chunk anti-repetition: mine phrases the model has already overused
+        # across everything written so far and ask it to avoid them in this chunk.
+        # Best-effort and bounded; never fatal.
+        if repetition_guard is not None and outputs:
+            try:
+                prior_text = "\n".join(outputs)[-12000:]
+                overused = repetition_guard.extract_overused_phrases(prior_text, top_k=10)
+                avoid_directive = repetition_guard.build_avoid_directive(overused)
+                if avoid_directive:
+                    story_context += "\n\n" + avoid_directive
+            except Exception as exc:  # noqa: BLE001 - enhancement only, never fatal.
+                logger.warning("repetition_guard phrase extraction failed: %s", exc)
+
         if progress:
             ch = f"第{chunk.chapter_index + 1}章 " if (chapter_count > 1 or chunk.chapter_title) else ""
             progress(f"正在改寫{ch}第 {idx}/{total} 段，原文字數 {len(chunk.text)}...")
         previous_tail = outputs[-1] if outputs else ""
-        rewritten, info = rewrite_chunk(
-            source_chunk=chunk.text,
-            chunk_index=idx,
-            chunks_total=total,
-            settings=settings,
-            api_client=api_client,
-            lora_client=lora_client,
-            previous_tail=previous_tail,
-            story_context=story_context,
-        )
+        try:
+            rewritten, info = rewrite_chunk(
+                source_chunk=chunk.text,
+                chunk_index=idx,
+                chunks_total=total,
+                settings=settings,
+                api_client=api_client,
+                lora_client=lora_client,
+                previous_tail=previous_tail,
+                story_context=story_context,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep partial output instead of aborting the whole run.
+            logger.error("Chunk %d/%d rewrite failed: %s", idx, total, exc, exc_info=True)
+            rewritten = f"[第 {idx}/{total} 段改寫失敗：{exc}]"
+            info = {
+                "mode": settings.mode,
+                "operation": settings.operation,
+                "spine_updates": 0,
+                "chunk_error": str(exc),
+            }
         info["chapter_index"] = chunk.chapter_index
         echo_context = "\n".join(
             part for part in [settings.diagnosis_brief, spine.echo_context(), story.digest] if part.strip()
@@ -1724,7 +1868,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.75)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--repetition-penalty", type=float, default=1.05, help="外部 API 重複懲罰（DZMM 建議 1.05）。")
-    parser.add_argument("--api-key", default=DEFAULT_API_KEY)
+    parser.add_argument("--api-key", default="", help="外部 API 金鑰；留空則從環境變數／設定讀取。")
     parser.add_argument("--api-base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--api-model", default=DEFAULT_MODEL)
     parser.add_argument("--style-file", action="append", default=[])

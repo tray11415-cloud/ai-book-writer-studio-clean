@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 
 from skill_technique_review import (
+    drop_unsafe_lines,
     extract_headings,
     extract_keyword_lines,
     read_text,
@@ -18,6 +20,8 @@ from skill_technique_review import (
     to_positive_int,
     trim_text,
 )
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_REPORT_DISTILL_GOAL = (
@@ -134,7 +138,7 @@ def distill_full_report_to_agent_library(
             mode = f"Grok / {analysis_model_name.strip()}"
 
         sections = parse_distilled_sections(library)
-        output_path = write_distilled_library(
+        output_path, preview = write_distilled_library(
             source_label=source_label,
             mode=mode,
             goal=goal,
@@ -143,7 +147,6 @@ def distill_full_report_to_agent_library(
             memory_insert=sections["memory_insert"],
             director_instruction=sections["director_instruction"],
         )
-        preview = output_path.read_text(encoding="utf-8")
         status = (
             "[OK] full_report 已蒸餾成寫作 AGENT 精簡技法庫。\n"
             f"來源：{source_label}\n"
@@ -159,7 +162,19 @@ def distill_full_report_to_agent_library(
             sections["memory_insert"],
             sections["director_instruction"],
         )
-    except Exception as exc:
+    except ValueError as exc:
+        # Bad/missing input paths surfaced by load_report_source(); user-facing.
+        logger.warning("Distillation input error: %s", exc)
+        return f"[ERROR] {exc}", "", None, "", "", ""
+    except OpenAIError as exc:
+        logger.exception("Distillation API error")
+        return f"[ERROR] 分析 API 失敗：{exc}", "", None, "", "", ""
+    except OSError as exc:
+        # File I/O: missing dir, disk full, permission denied, etc.
+        logger.exception("Distillation file I/O error")
+        return f"[ERROR] 檔案讀寫失敗：{exc}", "", None, "", "", ""
+    except Exception as exc:  # noqa: BLE001 - last-resort guard keeps the UI responsive
+        logger.exception("Unexpected error during report distillation")
         return f"[ERROR] {exc}", "", None, "", "", ""
 
 
@@ -257,6 +272,9 @@ def load_report_source(report_file: Any, report_path: str, report_text: str) -> 
         return report_text, "pasted-report"
     latest = find_latest_full_report()
     if latest:
+        # No explicit source given; fall back to the most recent report but log it
+        # so an accidental empty-input run is traceable.
+        logger.warning("No report source provided; falling back to latest full report: %s", latest)
         return read_text(latest), str(latest)
     return "", ""
 
@@ -428,6 +446,8 @@ def build_director_lines(candidates: list[str]) -> list[str]:
             distilled.append(line)
         if len(distilled) >= 5:
             break
+    # Strategy: prefer up to 5 distilled craft lines, then top up with defaults,
+    # capped at 8 total. Defaults always backfill so the result is never empty.
     return (distilled + defaults)[:8]
 
 
@@ -439,56 +459,85 @@ def ask_grok_to_distill_library(
     goal: str,
     output_language: str,
     max_library_chars: int,
+    model_max_output_tokens: int = 6000,
 ) -> str:
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "你是小說寫作技法蒸餾 Agent。你的任務是把分析報告壓縮成安全、精簡、"
-                    "可直接放進寫作 AGENT prompt 的技法庫。不要引用原文句子，不要延續原作情節，"
-                    "不要輸出未成年性內容或其他不適合進入寫作提示詞的內容。"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"/goal: {goal}\n"
-                    f"Output language: {output_language}\n"
-                    f"Maximum output characters: about {max_library_chars}\n\n"
-                    "請嚴格使用以下 Markdown 結構輸出：\n"
-                    "# Agent Compact Technique Library\n"
-                    "## Technique Library\n"
-                    "### Core Craft Rules\n"
-                    "### Scene / Action / Situation Methods\n"
-                    "### Style And Rhythm Rules\n"
-                    "## Story Memory Insert\n"
-                    "## Director Instruction Insert\n\n"
-                    "蒸餾規則：\n"
-                    "- 只輸出高階寫作技巧、節奏規則、場景調度與可用指令。\n"
-                    "- 不要引用原文，不要保留角色名，不要保留原作情節。\n"
-                    "- 如果報告中出現拒絕分析或敏感題材，只轉成安全的避用提醒，不展開內容。\n\n"
-                    f"來源報告摘錄：\n{source_text}"
-                ),
-            },
-        ],
-        temperature=0.25,
-        max_tokens=min(max(max_library_chars // 2, 1600), 6000),
-    )
-    return (response.choices[0].message.content or "").strip()
+    # Cap requested completion tokens by the model's output budget (minus a small
+    # safety margin) so we don't trip 'max_tokens exceeds limit' API errors.
+    output_token_ceiling = max(min(model_max_output_tokens - 100, 6000), 256)
+    max_tokens = min(max(max_library_chars // 2, 1600), output_token_ceiling)
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是小說寫作技法蒸餾 Agent。你的任務是把分析報告壓縮成安全、精簡、"
+                        "可直接放進寫作 AGENT prompt 的技法庫。不要引用原文句子，不要延續原作情節，"
+                        "不要輸出未成年性內容或其他不適合進入寫作提示詞的內容。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"/goal: {goal}\n"
+                        f"Output language: {output_language}\n"
+                        f"Maximum output characters: about {max_library_chars}\n\n"
+                        "請嚴格使用以下 Markdown 結構輸出：\n"
+                        "# Agent Compact Technique Library\n"
+                        "## Technique Library\n"
+                        "### Core Craft Rules\n"
+                        "### Scene / Action / Situation Methods\n"
+                        "### Style And Rhythm Rules\n"
+                        "## Story Memory Insert\n"
+                        "## Director Instruction Insert\n\n"
+                        "蒸餾規則：\n"
+                        "- 只輸出高階寫作技巧、節奏規則、場景調度與可用指令。\n"
+                        "- 不要引用原文，不要保留角色名，不要保留原作情節。\n"
+                        "- 如果報告中出現拒絕分析或敏感題材，只轉成安全的避用提醒，不展開內容。\n\n"
+                        f"來源報告摘錄：\n{source_text}"
+                    ),
+                },
+            ],
+            temperature=0.25,
+            max_tokens=max_tokens,
+        )
+    except (OpenAIError, TimeoutError, ConnectionError) as exc:
+        # Network / API failure (incl. the 900s timeout): degrade gracefully to a
+        # locally-built compact library instead of crashing the distillation flow.
+        logger.warning("Grok distillation API call failed (%s); using local fallback.", exc)
+        return build_local_compact_library(source_text, goal, output_language, max_library_chars)
+
+    try:
+        content = response.choices[0].message.content
+    except (IndexError, AttributeError) as exc:
+        logger.warning("Grok distillation returned an unexpected response shape (%s); using local fallback.", exc)
+        return build_local_compact_library(source_text, goal, output_language, max_library_chars)
+
+    content = (content or "").strip()
+    if not content:
+        logger.warning("Grok distillation returned empty content; using local fallback.")
+        return build_local_compact_library(source_text, goal, output_language, max_library_chars)
+    return content
 
 
 def parse_distilled_sections(library: str) -> dict[str, str]:
     text = clean_for_agent_prompt(library).strip()
+    if not re.search(r"(?m)^##\s+\S", text):
+        # Output does not follow the expected '## heading' structure; section
+        # extraction will fall back to generic content below.
+        logger.warning("Distilled library lacks expected '## ' headings; using fallback sections.")
     technique = extract_section(text, "Technique Library")
     memory = extract_section(text, "Story Memory Insert")
     director = extract_section(text, "Director Instruction Insert")
     if not technique:
+        logger.warning("Technique Library section missing; falling back to full distilled text.")
         technique = text
     if not memory:
+        logger.warning("Story Memory Insert section missing; using default memory insert.")
         memory = "Technique memory: Use the compact technique library as soft craft guidance; do not copy source plot or wording."
     if not director:
+        logger.warning("Director Instruction Insert section missing; synthesizing director lines.")
         director = "\n".join(build_director_lines([line for line in text.splitlines() if is_safe_craft_line(line)]))
     return {
         "technique_library": technique.strip(),
@@ -498,8 +547,13 @@ def parse_distilled_sections(library: str) -> dict[str, str]:
 
 
 def extract_section(text: str, title: str) -> str:
+    if not text:
+        return ""
+    # Tolerant of malformed markdown: allow leading whitespace, optional bold
+    # markers around the title, and trailing text on the heading line. Stops at
+    # the next level-1/2 heading or end of text.
     pattern = re.compile(
-        rf"^##\s+{re.escape(title)}\s*$([\s\S]*?)(?=^##\s+|\Z)",
+        rf"^[ \t]*#{{1,2}}\s+\**{re.escape(title)}\**.*$([\s\S]*?)(?=^[ \t]*#{{1,2}}\s+|\Z)",
         re.MULTILINE,
     )
     match = pattern.search(text)
@@ -515,7 +569,7 @@ def write_distilled_library(
     technique_library: str,
     memory_insert: str,
     director_instruction: str,
-) -> Path:
+) -> tuple[Path, str]:
     raw_library = clean_for_agent_prompt(raw_library)
     technique_library = clean_for_agent_prompt(technique_library)
     memory_insert = clean_for_agent_prompt(memory_insert)
@@ -566,7 +620,9 @@ def write_distilled_library(
         ),
         encoding="utf-8",
     )
-    return output_path
+    # Return the markdown we just wrote so callers don't re-read it from disk
+    # (avoids a redundant read that could fail/mask the real error).
+    return output_path, markdown
 
 
 def find_latest_full_report() -> Path | None:
@@ -584,8 +640,17 @@ def find_latest_distilled_library() -> DistilledLibrary | None:
     ]
     if not files:
         return None
-    path = max(files, key=lambda item: (item.parent.name, item.stat().st_mtime))
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    # Prefer the real file mtime as the primary key; directory name (timestamp)
+    # is only a stable tiebreaker. Avoids loading an older library on collisions.
+    path = max(files, key=lambda item: (item.stat().st_mtime, item.parent.name))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Skipping corrupted distilled library %s: %s", path, exc)
+        return None
+    if not isinstance(payload, dict):
+        logger.warning("Skipping distilled library with unexpected JSON shape: %s", path)
+        return None
     return DistilledLibrary(
         source_label=payload.get("source", str(path)),
         mode=payload.get("mode", "saved"),
@@ -600,6 +665,9 @@ def merge_text_field(current: str, incoming: str, header: str, replace: bool) ->
     incoming = (incoming or "").strip()
     if not incoming:
         return current or ""
+    # Keep the header on a single line so the '[header]' block stays well-formed
+    # even if a caller ever passes a multi-line header.
+    header = " ".join(str(header).split())
     block = f"[{header}]\n{incoming}"
     if replace:
         return incoming
@@ -608,9 +676,6 @@ def merge_text_field(current: str, incoming: str, header: str, replace: bool) ->
 
 
 def clean_for_agent_prompt(text: str) -> str:
-    lines = []
-    for line in sanitize_review_text(text).splitlines():
-        if any(marker.lower() in line.lower() for marker in UNSAFE_LINE_MARKERS):
-            continue
-        lines.append(line)
-    return "\n".join(lines).strip()
+    # Delegates to the shared sanitize-then-filter helper in skill_technique_review
+    # so the line-dropping logic lives in exactly one place.
+    return drop_unsafe_lines(text, UNSAFE_LINE_MARKERS)

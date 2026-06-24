@@ -1,9 +1,18 @@
-"""Main class for generating books using AutoGen with improved iteration control"""
+"""Book generation using the legacy AutoGen multi-agent pipeline.
+
+LEGACY / CLI ONLY: This module is part of the older AutoGen book pipeline that is
+reachable only via ``main.py`` (run directly from the command line). It is NOT used
+by the live applications. The maintained, user-facing pipelines are ``app_gradio.py``
+(the Gradio Studio UI) and ``web_app.py`` (the Flask web app), which use their own
+generation logic (repetition_guard, technique libraries, etc.). Keep this module
+correct and importable, but prefer the live apps for actual book generation.
+"""
 import autogen
 from typing import Dict, List, Optional
 import os
 import time
 import re
+import json
 
 class BookGenerator:
     def __init__(self, agents: Dict[str, autogen.ConversableAgent], agent_config: Dict, outline: List[Dict]):
@@ -12,9 +21,30 @@ class BookGenerator:
         self.agent_config = agent_config
         self.output_dir = "book_output"
         self.chapters_memory = []  # Store chapter summaries
-        self.max_iterations = 3  # Limit editor-writer iterations
+        self.max_iterations = 3  # Limit editor-writer iterations (used for group chat rounds)
         self.outline = outline  # Store the outline
         os.makedirs(self.output_dir, exist_ok=True)
+        self._memory_file = os.path.join(self.output_dir, "chapters_memory.json")
+        self._load_chapters_memory()
+
+    def _load_chapters_memory(self) -> None:
+        """Restore chapter summaries from disk so continuity survives a restart."""
+        try:
+            with open(self._memory_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    self.chapters_memory = data
+        except (FileNotFoundError, ValueError, OSError) as e:
+            # Missing/corrupt memory file is non-fatal: start with an empty list.
+            print(f"No prior chapter memory loaded ({e}); starting fresh.")
+
+    def _save_chapters_memory(self) -> None:
+        """Persist chapter summaries so a crash mid-generation does not lose context."""
+        try:
+            with open(self._memory_file, "w", encoding="utf-8") as f:
+                json.dump(self.chapters_memory, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"Warning: could not persist chapter memory: {e}")
 
     def _clean_chapter_content(self, content: str) -> str:
         """Clean up chapter content by removing artifacts and chapter numbers"""
@@ -56,7 +86,9 @@ class BookGenerator:
                 writer_final
             ],
             messages=messages,
-            max_round=5,
+            # One round per agent plus a buffer, derived from max_iterations so the
+            # configured iteration budget actually has an effect.
+            max_round=self.max_iterations + 2,
             speaker_selection_method="round_robin"
         )
 
@@ -64,54 +96,48 @@ class BookGenerator:
         """Helper to get sender from message regardless of format"""
         return msg.get("sender") or msg.get("name", "")
 
-    def _verify_chapter_complete(self, messages: List[Dict]) -> bool:
-        """Verify chapter completion by analyzing entire conversation context"""
-        print("******************** VERIFYING CHAPTER COMPLETION ****************")
-        current_chapter = None
-        chapter_content = None
+    def _is_chapter_complete(self, messages: List[Dict]) -> bool:
+        """Check (without side effects) whether the conversation produced a complete chapter.
+
+        This only inspects state; it does NOT save anything. Saving is handled
+        exclusively by ``_process_chapter_results``/``_save_chapter`` so there is a
+        single, consistent save path that always receives the messages list.
+
+        The tags checked here intentionally match what the agents in ``agents.py``
+        actually emit: the memory keeper emits ``MEMORY UPDATE:``, the writer emits
+        ``SCENE:`` / ``SCENE FINAL:``, and the editor emits ``FEEDBACK:``.
+        """
+        print("Verifying chapter completion...")
         sequence_complete = {
             'memory_update': False,
-            'plan': False,
-            'setting': False,
             'scene': False,
             'feedback': False,
             'scene_final': False,
-            'confirmation': False
         }
-        
+        chapter_content = None
+
         # Analyze full conversation
         for msg in messages:
             content = msg.get("content", "")
-            
-            # Track chapter number
-            if not current_chapter:
-                num_match = re.search(r"Chapter (\d+):", content)
-                if num_match:
-                    current_chapter = int(num_match.group(1))
-            
-            # Track completion sequence
-            if "MEMORY UPDATE:" in content: sequence_complete['memory_update'] = True
-            if "PLAN:" in content: sequence_complete['plan'] = True
-            if "SETTING:" in content: sequence_complete['setting'] = True
-            if "SCENE:" in content: sequence_complete['scene'] = True
-            if "FEEDBACK:" in content: sequence_complete['feedback'] = True
+
+            if "MEMORY UPDATE:" in content:
+                sequence_complete['memory_update'] = True
+            # Check the most specific tag first to avoid the "SCENE" substring of
+            # "SCENE FINAL" setting both flags from a single final message.
             if "SCENE FINAL:" in content:
                 sequence_complete['scene_final'] = True
                 chapter_content = content.split("SCENE FINAL:")[1].strip()
-            if "**Confirmation:**" in content and "successfully" in content:
-                sequence_complete['confirmation'] = True
+            elif "SCENE:" in content:
+                sequence_complete['scene'] = True
+            if "FEEDBACK:" in content:
+                sequence_complete['feedback'] = True
 
-            #print all sequence_complete flags
-            print("******************** SEQUENCE COMPLETE **************", sequence_complete)
-            print("******************** CURRENT_CHAPTER ****************", current_chapter)
-            print("******************** CHAPTER_CONTENT ****************", chapter_content)
-        
-        # Verify all steps completed and content exists
-        if all(sequence_complete.values()) and current_chapter and chapter_content:
-            self._save_chapter(current_chapter, chapter_content)
-            return True
-            
-        return False
+        # A chapter is complete when the writer produced a final scene with content.
+        # The other flags are informative but the final scene is the hard requirement.
+        return bool(sequence_complete['scene_final'] and chapter_content)
+
+    # Backwards-compatible alias for the previous method name.
+    _verify_chapter_complete = _is_chapter_complete
     
     def _prepare_chapter_context(self, chapter_number: int, prompt: str) -> str:
         """Prepare context for chapter generation"""
@@ -129,7 +155,14 @@ class BookGenerator:
     def generate_chapter(self, chapter_number: int, prompt: str) -> None:
         """Generate a single chapter with completion verification"""
         print(f"\nGenerating Chapter {chapter_number}...")
-        
+
+        # Bounds check: the outline may have fewer chapters than requested.
+        if chapter_number - 1 >= len(self.outline) or chapter_number < 1:
+            raise ValueError(
+                f"Chapter {chapter_number} not found in outline "
+                f"(outline has {len(self.outline)} chapters)"
+            )
+
         try:
             # Create group chat with reduced rounds
             groupchat = self.initiate_group_chat()
@@ -171,7 +204,7 @@ class BookGenerator:
                 message=chapter_prompt
             )
 
-            if not self._verify_chapter_complete(groupchat.messages):
+            if not self._is_chapter_complete(groupchat.messages):
                 raise ValueError(f"Chapter {chapter_number} generation incomplete")
         
             self._process_chapter_results(chapter_number, groupchat.messages)
@@ -191,8 +224,12 @@ class BookGenerator:
         for msg in reversed(messages):
             content = msg.get("content", "")
             sender = self._get_sender(msg)
-            
-            if sender in ["writer", "writer_final"]:
+
+            # AutoGen groupchat messages carry the agent name in "name" (mapped by
+            # _get_sender), but it may be empty in some contexts. The SCENE/SCENE FINAL
+            # tags are the real signal, so accept writer agents OR any message that
+            # carries those tags with no conflicting attribution.
+            if sender in ["writer", "writer_final", ""] or "SCENE FINAL:" in content or "SCENE:" in content:
                 # Handle complete scene content
                 if "SCENE FINAL:" in content:
                     scene_text = content.split("SCENE FINAL:")[1].strip()
@@ -249,10 +286,15 @@ Keep it simple and direct."""
             
             # Save the retry results
             self._process_chapter_results(chapter_number, retry_groupchat.messages)
-            
+
         except Exception as e:
             print(f"Error in retry attempt for Chapter {chapter_number}: {str(e)}")
-            print("Unable to generate chapter content after retry")
+            # Do NOT swallow the failure: re-raise so the caller (generate_book)
+            # can detect that the chapter was never produced and halt, rather than
+            # silently skipping chapters and producing a truncated book.
+            raise RuntimeError(
+                f"Failed to generate chapter {chapter_number} after retry"
+            ) from e
 
     def _process_chapter_results(self, chapter_number: int, messages: List[Dict]) -> None:
         """Process and save chapter results, updating memory"""
@@ -277,7 +319,10 @@ Keep it simple and direct."""
                 if chapter_content:
                     basic_summary = f"Chapter {chapter_number} Summary: {chapter_content[:200]}..."
                     self.chapters_memory.append(basic_summary)
-            
+
+            # Persist accumulated memory so continuity survives interruptions.
+            self._save_chapters_memory()
+
             # Extract and save the chapter content
             self._save_chapter(chapter_number, messages)
             
@@ -287,6 +332,10 @@ Keep it simple and direct."""
 
     def _save_chapter(self, chapter_number: int, messages: List[Dict]) -> None:
         print(f"\nSaving Chapter {chapter_number}")
+        # Guard against path traversal / malformed filenames: the chapter number is
+        # interpolated into the output path, so require a positive integer.
+        if not isinstance(chapter_number, int) or chapter_number < 1:
+            raise ValueError(f"Invalid chapter number: {chapter_number!r}")
         try:
             chapter_content = self._extract_final_scene(messages)
             if not chapter_content:

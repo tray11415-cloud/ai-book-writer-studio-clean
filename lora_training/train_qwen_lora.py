@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 
 
@@ -11,7 +12,11 @@ def load_rows(path: Path) -> list[dict]:
         for line in handle:
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
+                try:
+                    rows.append(json.loads(line))
+                except (json.JSONDecodeError, ValueError) as exc:
+                    print(f"[WARN] Skipped malformed line: {exc}")
+                    continue
     return rows
 
 
@@ -36,12 +41,18 @@ def main() -> int:
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--max-samples", type=int, default=0, help="Use only the first N samples. 0 means all samples.")
     parser.add_argument("--max-steps", type=int, default=-1, help="Stop after this many optimizer steps. -1 means full epochs.")
-    parser.add_argument("--target-loss", type=float, default=0.0, help="Stop training when logged loss is at or below this value. 0 disables it.")
+    parser.add_argument("--val-split", type=float, default=0.0, help="Fraction of samples held out for validation (0.0-0.5). 0 disables validation.")
+    parser.add_argument("--target-loss", type=float, default=0.0, help="Stop training when the average logged loss (aggregated over logging_steps) is at or below this value. Must be >= 0; set to 0 to disable.")
     parser.add_argument("--target-loss-patience", type=int, default=3, help="Required consecutive logged losses at or below target-loss.")
     parser.add_argument("--target-loss-min-steps", type=int, default=0, help="Ignore target-loss before this optimizer step.")
     parser.add_argument("--save-steps", type=int, default=250, help="Save checkpoints every N steps. 0 saves by epoch only.")
     parser.add_argument("--no-4bit", action="store_true", help="Disable 4-bit loading. Not recommended for 16GB VRAM.")
     args = parser.parse_args()
+
+    if args.target_loss < 0:
+        parser.error("--target-loss must be >= 0 (set to 0 to disable target-loss stopping).")
+    if not 0.0 <= args.val_split <= 0.5:
+        parser.error("--val-split must be between 0.0 and 0.5.")
 
     rows = load_rows(args.train_file)
     if args.max_samples > 0:
@@ -119,8 +130,24 @@ def main() -> int:
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    texts = [format_chat(tokenizer, row) for row in rows]
-    dataset = Dataset.from_dict({"text": texts})
+    # Optionally hold out a reproducible validation split so overfitting is observable.
+    eval_rows: list[dict] = []
+    train_rows = rows
+    if args.val_split > 0 and len(rows) >= 2:
+        shuffled = rows[:]
+        random.Random(42).shuffle(shuffled)
+        val_count = max(1, int(len(shuffled) * args.val_split))
+        val_count = min(val_count, len(shuffled) - 1)
+        eval_rows = shuffled[:val_count]
+        train_rows = shuffled[val_count:]
+        print(f"Train samples: {len(train_rows)} | Validation samples: {len(eval_rows)}")
+
+    def build_dataset(source_rows: list[dict]):
+        texts = [format_chat(tokenizer, row) for row in source_rows]
+        return Dataset.from_dict({"text": texts})
+
+    dataset = build_dataset(train_rows)
+    eval_dataset_raw = build_dataset(eval_rows) if eval_rows else None
 
     def tokenize(batch):
         tokenized = tokenizer(
@@ -133,9 +160,17 @@ def main() -> int:
         return tokenized
 
     tokenized_dataset = dataset.map(tokenize, batched=True, remove_columns=["text"])
+    tokenized_eval_dataset = (
+        eval_dataset_raw.map(tokenize, batched=True, remove_columns=["text"])
+        if eval_dataset_raw is not None
+        else None
+    )
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     save_strategy = "steps" if args.save_steps > 0 else "epoch"
+    eval_kwargs: dict = {}
+    if tokenized_eval_dataset is not None:
+        eval_kwargs = {"eval_strategy": "steps", "eval_steps": 50}
     training_args = TrainingArguments(
         output_dir=str(args.output_dir),
         per_device_train_batch_size=args.batch_size,
@@ -152,6 +187,7 @@ def main() -> int:
         optim="paged_adamw_8bit" if not args.no_4bit else "adamw_torch",
         gradient_checkpointing=True,
         remove_unused_columns=False,
+        **eval_kwargs,
     )
 
     callbacks = []
@@ -193,6 +229,7 @@ def main() -> int:
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset,
+        eval_dataset=tokenized_eval_dataset,
         data_collator=collator,
         callbacks=callbacks,
     )

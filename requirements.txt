@@ -1,20 +1,40 @@
-# Core dependencies
+# ---------------------------------------------------------------------------
+# Runtime dependencies (required to run the studio and the legacy pipeline)
+# ---------------------------------------------------------------------------
+
+# Legacy AutoGen multi-agent book generator (main.py / agents.py / book_generator.py).
 autogen>=0.2.0
+
+# OpenAI-compatible client used by the studio, web chat, and compat proxy.
 openai>=1.30.0
 
-# Development dependencies
-pytest>=7.0.0  # For testing
-black>=22.0.0  # For code formatting
-flake8>=4.0.0  # For linting
-mypy>=0.910  # For type checking
+# .env loading (config.py, app_gradio.py, web_app.py, compat_proxy.py).
+python-dotenv>=0.19.0
 
-# Optional dependencies
-tqdm>=4.65.0  # For progress bars
-python-dotenv>=0.19.0  # For environment variable management
+# HTTP client used by the compatibility proxy (compat_proxy.py).
 requests>=2.31.0
-beautifulsoup4>=4.12.3
+
+# Flask chat UI (web_app.py).
 Flask>=3.0.0
+
+# Gradio studio (app_gradio.py). Pin to 4.x as the app targets gradio 4.44.
 gradio>=4.44.0,<5.0.0
-huggingface_hub<1.0
+
+# Pulled in / relied on alongside gradio at runtime.
 fastapi==0.115.2
 starlette==0.38.6
+huggingface_hub<1.0
+
+# Progress bars and HTML parsing used by the reference/import helpers.
+tqdm>=4.65.0
+beautifulsoup4>=4.12.3
+
+# ---------------------------------------------------------------------------
+# Optional: development tools only (NOT required to run the app).
+# Install with:  pip install -r requirements.txt   then they are present,
+# or comment this block out for a lean runtime-only environment.
+# ---------------------------------------------------------------------------
+pytest>=7.0.0   # tests
+black>=22.0.0   # code formatting
+flake8>=4.0.0   # linting
+mypy>=0.910     # type checking

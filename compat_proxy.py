@@ -1,6 +1,7 @@
 """Local compatibility proxy for SSE-style OpenAI-like upstreams."""
 import json
 import os
+import socket
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Iterable
@@ -24,6 +25,14 @@ UPSTREAM_API_KEY = (
     or ""
 )
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "nalang-turbo-0826")
+# Cap the request body we will read and the upstream response we will buffer,
+# to avoid memory exhaustion from malformed clients or pathological upstreams.
+MAX_REQUEST_SIZE = int(os.getenv("COMPAT_PROXY_MAX_REQUEST_SIZE", str(10 * 1024 * 1024)))
+MAX_RESPONSE_SIZE = int(os.getenv("COMPAT_PROXY_MAX_RESPONSE_SIZE", str(10 * 1024 * 1024)))
+
+
+class BadRequest(Exception):
+    """Raised for malformed client requests so they map to a 400 response."""
 DZMM_MODELS = [
     "x-apex-surge-0505-16k",
     "x-apex-surge-0505",
@@ -98,7 +107,15 @@ class CompatProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_json_body(self) -> dict:
-        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            content_length = int(raw_length)
+        except (ValueError, TypeError):
+            raise BadRequest("Invalid Content-Length header")
+        if content_length < 0:
+            raise BadRequest("Invalid Content-Length header")
+        if content_length > MAX_REQUEST_SIZE:
+            raise BadRequest("Request body too large")
         raw = self.rfile.read(content_length) if content_length else b"{}"
         return json.loads(raw.decode("utf-8") or "{}")
 
@@ -151,10 +168,25 @@ class CompatProxyHandler(BaseHTTPRequestHandler):
                 },
                 json=request_body,
                 timeout=180,
+                stream=True,
             )
-            upstream_response.raise_for_status()
+            try:
+                upstream_response.raise_for_status()
 
-            upstream_text = upstream_response.content.decode("utf-8", errors="replace")
+                # Buffer the upstream body with a hard size cap so a pathological
+                # (huge) response cannot exhaust memory. bytearray.extend avoids
+                # the O(n^2) reallocations of repeated bytes concatenation.
+                data = bytearray()
+                for chunk in upstream_response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    data.extend(chunk)
+                    if len(data) > MAX_RESPONSE_SIZE:
+                        raise ValueError("Upstream response exceeded size limit")
+            finally:
+                upstream_response.close()
+
+            upstream_text = bytes(data).decode("utf-8", errors="replace")
             text = _extract_message_text(upstream_text)
             now_ts = int(datetime.now(tz=timezone.utc).timestamp())
             response_payload = {
@@ -179,9 +211,17 @@ class CompatProxyHandler(BaseHTTPRequestHandler):
                 },
             }
             self._send_json(response_payload)
+        except BadRequest as exc:
+            self._send_json({"error": str(exc)}, status=400)
+        except json.JSONDecodeError as exc:
+            self._send_json({"error": f"Invalid request JSON: {exc}"}, status=400)
         except requests.HTTPError as exc:
             detail = exc.response.text if exc.response is not None else str(exc)
             self._send_json({"error": detail}, status=502)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            self._send_json(
+                {"error": f"Upstream connection failed: {exc}"}, status=504
+            )
         except Exception as exc:  # noqa: BLE001
             self._send_json({"error": str(exc)}, status=500)
 
@@ -191,9 +231,27 @@ class CompatProxyHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    server = ThreadingHTTPServer((HOST, PORT), CompatProxyHandler)
+    ThreadingHTTPServer.allow_reuse_address = True
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), CompatProxyHandler)
+    except OSError as exc:
+        # Most commonly the port is already in use (e.g. a zombie instance or
+        # another service). Fail loudly with an actionable message instead of a
+        # bare traceback.
+        print(
+            f"Failed to bind compat proxy on {HOST}:{PORT}: {exc}. "
+            "Is another instance already running, or is the port in use?"
+        )
+        raise SystemExit(1)
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     print(f"Compat proxy listening on http://{HOST}:{PORT}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,15 +12,23 @@ from typing import Any
 from openai import OpenAI
 
 from chapter_craft_skill import (
+    API_TIMEOUT,
+    SPECIALIST_MAX_WORKERS,
     Chapter,
+    chat_complete,
+    language_instruction,
     load_chapters,
     normalize_text,
     slugify,
     to_positive_int,
     trim_chapter_text,
     trim_preview,
+    write_text_with_backup,
 )
 from lora_runtime import LORA_BASE_URL, LORA_MODEL_NAME, ensure_lora_server_running
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_PLOT_GOAL = (
@@ -213,7 +222,9 @@ def extract_reference_craft_dna(
     if route.client is None:
         raise RuntimeError("缺少 LLM client。")
 
-    response = route.client.chat.completions.create(
+    return chat_complete(
+        route.client,
+        label="技法 DNA 蒸餾",
         model=route.model_name,
         messages=[
             {
@@ -242,7 +253,6 @@ def extract_reference_craft_dna(
         temperature=0.2,
         max_tokens=1800,
     )
-    return read_message(response)
 
 
 def run_plot_cluster(
@@ -275,11 +285,12 @@ def run_plot_cluster(
         ]
 
     results: list[PlotRoleResult] = []
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    failed: list[str] = []
+    with ThreadPoolExecutor(max_workers=SPECIALIST_MAX_WORKERS) as executor:
         futures = {
             executor.submit(
                 ask_plot_role,
-                routes[PLOT_ROLE_ROUTES[role]],
+                resolve_route(routes, role),
                 role,
                 spec["title"],
                 spec["focus"],
@@ -295,10 +306,35 @@ def run_plot_cluster(
             for role, spec in PLOT_ROLES.items()
         }
         for future in as_completed(futures):
-            results.append(future.result())
+            role = futures[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                # Keep remaining roles alive; surface which one failed.
+                logger.error("劇情角色 %s 執行失敗：%s", role, exc)
+                spec = PLOT_ROLES[role]
+                failed.append(spec["title"])
+                results.append(
+                    PlotRoleResult(
+                        role=role,
+                        title=spec["title"],
+                        model_label=PLOT_ROLE_ROUTES.get(role, "?"),
+                        output=f"[ERROR] 此發想員執行失敗：{exc}",
+                    )
+                )
 
+    if failed:
+        logger.warning("以下發想員失敗：%s", "、".join(failed))
     role_order = list(PLOT_ROLES)
     return sorted(results, key=lambda item: role_order.index(item.role))
+
+
+def resolve_route(routes: dict[str, ModelRoute], role: str) -> ModelRoute:
+    """Look up the model route for a role, guarding missing config defensively."""
+    route_key = PLOT_ROLE_ROUTES.get(role, "Grok")
+    if route_key not in routes:
+        raise ValueError(f"找不到角色 {role} 對應的模型路由 {route_key}。")
+    return routes[route_key]
 
 
 def ask_plot_role(
@@ -317,7 +353,9 @@ def ask_plot_role(
 ) -> PlotRoleResult:
     if route.client is None:
         raise RuntimeError(f"缺少 {route.label} client。")
-    response = route.client.chat.completions.create(
+    output = chat_complete(
+        route.client,
+        label=f"劇情角色「{title}」",
         model=route.model_name,
         messages=[
             {
@@ -356,7 +394,7 @@ def ask_plot_role(
         role=role,
         title=title,
         model_label=f"{route.label} / {route.model_name}",
-        output=read_message(response),
+        output=output,
     )
 
 
@@ -380,7 +418,9 @@ def synthesize_plot_plan(
         raise RuntimeError("缺少 NALANG client。")
 
     notes = "\n\n".join(f"## {result.title}\n{result.output}" for result in role_results)
-    response = route.client.chat.completions.create(
+    return chat_complete(
+        route.client,
+        label="劇情總編整合",
         model=route.model_name,
         messages=[
             {
@@ -417,7 +457,6 @@ def synthesize_plot_plan(
         temperature=0.55,
         max_tokens=3600,
     )
-    return read_message(response)
 
 
 def write_plot_outputs(
@@ -451,11 +490,11 @@ def write_plot_outputs(
         ],
         "synthesis": synthesis,
     }
-    (output_dir / "plot_ideation.json").write_text(
+    write_text_with_backup(
+        output_dir / "plot_ideation.json",
         json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
-    (output_dir / "craft_dna.md").write_text("# 技法 DNA\n\n" + craft_dna + "\n", encoding="utf-8")
+    write_text_with_backup(output_dir / "craft_dna.md", "# 技法 DNA\n\n" + craft_dna + "\n")
 
     role_sections = "\n\n".join(
         f"## {result.title}\n\n模型：{result.model_label}\n\n{result.output}"
@@ -476,7 +515,7 @@ def write_plot_outputs(
         "## AI 發想叢集筆記\n\n"
         f"{role_sections}\n"
     )
-    (output_dir / "plot_ideation.md").write_text(report, encoding="utf-8")
+    write_text_with_backup(output_dir / "plot_ideation.md", report)
     return output_dir
 
 
@@ -556,21 +595,6 @@ def dry_run_synthesis(chapter_count: int, premise: str, genre_tone: str, arc_mod
     )
 
 
-def language_instruction(output_language: str) -> str:
-    mapping = {
-        "繁体中文": "請使用繁體中文。",
-        "繁體中文": "請使用繁體中文。",
-        "简体中文": "请使用简体中文。",
-        "English": "Use English.",
-        "日本語": "日本語で出力してください。",
-    }
-    return mapping.get(output_language or "", "請使用繁體中文。")
-
-
-def read_message(response: Any) -> str:
-    return (response.choices[0].message.content or "").strip()
-
-
 def build_dry_run_routes() -> dict[str, ModelRoute]:
     return {
         "Grok": ModelRoute("Grok", None, "dry-run-grok"),
@@ -606,7 +630,7 @@ def build_model_routes(
             OpenAI(
                 api_key=(analysis_api_key or "not-needed").strip(),
                 base_url=analysis_base_url.strip().rstrip("/"),
-                timeout=900,
+                timeout=API_TIMEOUT,
             ),
             analysis_model_name.strip(),
         ),
@@ -615,13 +639,13 @@ def build_model_routes(
             OpenAI(
                 api_key=(writing_api_key or "not-needed").strip(),
                 base_url=writing_base_url.strip().rstrip("/"),
-                timeout=900,
+                timeout=API_TIMEOUT,
             ),
             writing_model_name.strip(),
         ),
         "LoRA": ModelRoute(
             "LoRA",
-            OpenAI(api_key="not-needed", base_url=lora_base_url, timeout=900),
+            OpenAI(api_key="not-needed", base_url=lora_base_url, timeout=API_TIMEOUT),
             lora_model_name.strip(),
         ),
     }

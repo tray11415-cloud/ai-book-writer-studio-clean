@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import posixpath
+import random
 import re
 import zipfile
 from pathlib import Path
@@ -75,7 +77,26 @@ def score_decoded_text(text: str) -> int:
     return cjk * 3 + ascii_letters - penalty - control_penalty * 10
 
 
+# Encoding preference used to break ties when two candidate encodings score
+# identically (rare but possible). Lower number = more preferred. Note: files
+# that mix multiple encodings in sequence are not supported; the single best
+# whole-file decode wins and confidence reflects the score gap to the runner-up.
+ENCODING_PREFERENCE = {
+    "utf-8": 0,
+    "utf-8-sig": 1,
+    "gb18030": 2,
+    "gbk": 3,
+    "big5": 4,
+    "cp950": 5,
+}
+
+
 def decode_bytes(raw: bytes) -> tuple[str, str]:
+    text, encoding, _ = decode_bytes_with_confidence(raw)
+    return text, encoding
+
+
+def decode_bytes_with_confidence(raw: bytes) -> tuple[str, str, str]:
     candidates: list[tuple[int, str, str]] = []
     for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk", "big5", "cp950"):
         try:
@@ -86,10 +107,23 @@ def decode_bytes(raw: bytes) -> tuple[str, str]:
 
     if not candidates:
         text = raw.decode("utf-8", errors="replace")
-        return text, "utf-8-replace"
+        return text, "utf-8-replace", "low"
 
-    _, encoding, text = max(candidates, key=lambda item: item[0])
-    return text, encoding
+    # Rank by score, then by encoding preference for deterministic tie-breaking.
+    _, encoding, text = max(
+        candidates,
+        key=lambda item: (item[0], -ENCODING_PREFERENCE.get(item[1], 999)),
+    )
+
+    # Confidence is the score gap between the best and runner-up candidates.
+    sorted_scores = sorted((item[0] for item in candidates), reverse=True)
+    if len(sorted_scores) == 1:
+        confidence = "high"
+    else:
+        gap = sorted_scores[0] - sorted_scores[1]
+        confidence = "high" if gap > 100 else "medium" if gap > 20 else "low"
+
+    return text, encoding, confidence
 
 
 def normalize_text(text: str, converter, convert_to_traditional: bool) -> str:
@@ -177,11 +211,11 @@ def extract_epub_text(path: Path) -> str:
     return "\n\n".join(parts)
 
 
-def read_source_text(path: Path) -> tuple[str, str]:
+def read_source_text(path: Path) -> tuple[str, str, str]:
     if path.suffix.lower() == ".epub":
-        return extract_epub_text(path), "epub"
+        return extract_epub_text(path), "epub", "high"
     raw = path.read_bytes()
-    return decode_bytes(raw)
+    return decode_bytes_with_confidence(raw)
 
 
 def should_include(path: Path, source_root: Path, include_code: bool) -> bool:
@@ -269,7 +303,16 @@ def main() -> int:
         action="store_true",
         help="Do not write per-source cleaned copies. Useful when the source folder is already cleaned_files.",
     )
+    parser.add_argument(
+        "--val-split",
+        type=float,
+        default=0.0,
+        help="Fraction of samples to write to val.jsonl (0.0-0.5). 0 disables the validation split.",
+    )
     args = parser.parse_args()
+
+    if not 0.0 <= args.val_split <= 0.5:
+        parser.error("--val-split must be between 0.0 and 0.5.")
 
     source_root = args.source.resolve()
     output_dir = args.out.resolve()
@@ -288,8 +331,13 @@ def main() -> int:
     if not args.no_cleaned_copy:
         clean_files_dir.mkdir(parents=True, exist_ok=True)
 
+    # Track chunk hashes across ALL source files so duplicate passages that appear
+    # in multiple files are only emitted once (global, not per-file, dedup).
+    seen_hashes: set[str] = set()
+    duplicate_chunks_removed = 0
+
     for file_index, path in enumerate(files, 1):
-        text, encoding = read_source_text(path)
+        text, encoding, confidence = read_source_text(path)
         text = normalize_text(text, converter, convert_to_traditional)
         if not text or len(text) < args.min_chars:
             continue
@@ -303,12 +351,18 @@ def main() -> int:
             {
                 "source": relative,
                 "decoded_as": encoding,
+                "confidence": confidence,
                 "chars": len(text),
                 "cleaned_file": str(cleaned_file) if cleaned_file is not None else str(path),
             }
         )
         clean_sections.append(f"\n\n===== {relative} | decoded_as={encoding} =====\n\n{text}")
         for chunk in chunk_text(text, args.max_chars, args.min_chars):
+            chunk_hash = hashlib.md5(chunk.encode("utf-8")).hexdigest()
+            if chunk_hash in seen_hashes:
+                duplicate_chunks_removed += 1
+                continue
+            seen_hashes.add(chunk_hash)
             records.append(
                 {
                     "messages": [
@@ -324,18 +378,38 @@ def main() -> int:
 
     clean_corpus_path = output_dir / "clean_corpus.txt"
     train_path = output_dir / "train.jsonl"
+    val_path = output_dir / "val.jsonl"
     report_path = output_dir / "dataset_report.json"
 
+    # Reproducible train/validation split. With --val-split 0 (default) all
+    # samples go to train.jsonl, preserving the previous behavior.
+    train_records = records
+    val_records: list[dict] = []
+    if args.val_split > 0 and len(records) >= 2:
+        shuffled = records[:]
+        random.Random(42).shuffle(shuffled)
+        val_count = max(1, int(len(shuffled) * args.val_split))
+        val_count = min(val_count, len(shuffled) - 1)
+        val_records = shuffled[:val_count]
+        train_records = shuffled[val_count:]
+
     clean_corpus_path.write_text("".join(clean_sections).strip() + "\n", encoding="utf-8-sig")
-    write_jsonl(train_path, records)
+    write_jsonl(train_path, train_records)
+    if val_records:
+        write_jsonl(val_path, val_records)
     report = {
         "source": str(source_root),
         "files_scanned": len(files),
         "samples": len(records),
+        "train_samples": len(train_records),
+        "val_samples": len(val_records),
+        "val_split": args.val_split,
+        "duplicate_chunks_removed": duplicate_chunks_removed,
         "convert_to_traditional": convert_to_traditional and converter is not None,
         "include_code": args.include_code,
         "clean_corpus": str(clean_corpus_path),
         "train_jsonl": str(train_path),
+        "val_jsonl": str(val_path) if val_records else None,
         "cleaned_files_dir": None if args.no_cleaned_copy else str(clean_files_dir),
         "cleaned_copy_skipped": args.no_cleaned_copy,
         "included_sources": included_sources,
@@ -347,9 +421,15 @@ def main() -> int:
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8-sig")
 
     print(f"Scanned files: {len(files)}")
-    print(f"Training samples: {len(records)}")
+    print(f"Training samples: {len(train_records)}")
+    if val_records:
+        print(f"Validation samples: {len(val_records)}")
+    if duplicate_chunks_removed:
+        print(f"Duplicate chunks removed: {duplicate_chunks_removed}")
     print(f"Clean corpus: {clean_corpus_path}")
     print(f"Train JSONL: {train_path}")
+    if val_records:
+        print(f"Val JSONL: {val_path}")
     print(f"Report: {report_path}")
     if len(records) < 20:
         print("[WARN] Very few samples. This is not enough for a useful novel-writing LoRA.")

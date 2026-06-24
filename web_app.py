@@ -1,7 +1,9 @@
 """Local web UI for conversational story generation."""
+import logging
 import os
 import socket
 import threading
+import time
 import uuid
 from typing import Dict, List
 
@@ -15,15 +17,53 @@ from compat_proxy import main as run_compat_proxy
 from config import get_config
 from env_utils import get_dotenv_path
 from lora_runtime import ensure_lora_server_running, is_lora_base_url
+import repetition_guard as rg
 
 
 load_dotenv(get_dotenv_path())
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("web_app")
+
 app = Flask(__name__)
-app.secret_key = "ai-book-writer-web-secret"
+# Never hardcode a secret: read from env, fall back to a random per-process key.
+# The fallback is safe here because session state (CHAT_SESSIONS) is in-memory and
+# ephemeral; production deployments should set FLASK_SECRET_KEY to a persistent value.
+app.secret_key = os.getenv("FLASK_SECRET_KEY") or os.urandom(32)
+# Harden session cookies. SESSION_COOKIE_SECURE is opt-in (env) so local HTTP dev keeps
+# working; HttpOnly + SameSite=Lax are always safe and mitigate XSS/CSRF cookie theft.
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.getenv("FLASK_SESSION_COOKIE_SECURE", "0").strip().lower() in {
+    "1",
+    "true",
+    "on",
+    "yes",
+}
+# Cap request body size to avoid memory-exhaustion DoS via huge JSON payloads.
+app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("BOOK_WRITER_WEB_MAX_BODY_BYTES", str(5 * 1024 * 1024)))
 
 CHAT_SESSIONS: Dict[str, List[Dict[str, str]]] = {}
+# Last-access timestamp per session, used to prune stale in-memory histories.
+SESSION_LAST_ACCESS: Dict[str, float] = {}
+_SESSIONS_LOCK = threading.Lock()
+
 WEB_CHAT_MAX_TOKENS = int(os.getenv("BOOK_WRITER_CHAT_MAX_TOKENS", "4000"))
+# Max characters accepted in a single user message (DoS / token-explosion guard).
+WEB_CHAT_MAX_MESSAGE_CHARS = int(os.getenv("BOOK_WRITER_WEB_MAX_MESSAGE_CHARS", "8000"))
+# Sliding context window (characters) for the raw chat history sent to the model, so
+# context cannot grow unbounded as the story lengthens.
+WEB_CHAT_CONTEXT_WINDOW = int(os.getenv("BOOK_WRITER_CHAT_CONTEXT_WINDOW", "8000"))
+# Hard cap on retained messages per session (after which oldest turns are dropped).
+WEB_CHAT_MAX_HISTORY_MESSAGES = int(os.getenv("BOOK_WRITER_WEB_MAX_HISTORY_MESSAGES", "60"))
+# Idle sessions older than this (seconds) are pruned from memory.
+WEB_SESSION_TTL_SECONDS = int(os.getenv("BOOK_WRITER_WEB_SESSION_TTL_SECONDS", str(24 * 3600)))
+# Token-level repetition penalties (env-configurable), forwarded to the completion.
+WEB_CHAT_FREQUENCY_PENALTY = float(os.getenv("BOOK_WRITER_WEB_FREQUENCY_PENALTY", "0.5"))
+WEB_CHAT_PRESENCE_PENALTY = float(os.getenv("BOOK_WRITER_WEB_PRESENCE_PENALTY", "0.6"))
 
 SYSTEM_PROMPT = """You are a professional long-form fiction co-writer.
 Work with the user through chat to create a story scene by scene.
@@ -312,12 +352,72 @@ HTML_PAGE = """<!doctype html>
 </html>"""
 
 
+def _prune_stale_sessions(now: float) -> None:
+    """Drop in-memory histories for sessions idle longer than the TTL."""
+    if WEB_SESSION_TTL_SECONDS <= 0:
+        return
+    cutoff = now - WEB_SESSION_TTL_SECONDS
+    stale = [sid for sid, ts in SESSION_LAST_ACCESS.items() if ts < cutoff]
+    for sid in stale:
+        CHAT_SESSIONS.pop(sid, None)
+        SESSION_LAST_ACCESS.pop(sid, None)
+
+
+def _touch_session(session_id: str) -> None:
+    """Record last access and opportunistically clean up expired sessions."""
+    now = time.time()
+    with _SESSIONS_LOCK:
+        SESSION_LAST_ACCESS[session_id] = now
+        _prune_stale_sessions(now)
+
+
 def _get_session_id() -> str:
     session_id = session.get("chat_session_id")
     if not session_id:
         session_id = str(uuid.uuid4())
         session["chat_session_id"] = session_id
     return session_id
+
+
+def _trim_text(text: str, max_chars: int) -> str:
+    """Keep the most recent ``max_chars`` characters (mirrors app_gradio.trim_text)."""
+    text = (text or "").strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def _window_history(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Bound the chat history sent to the model so context cannot grow unbounded.
+
+    Keeps the most recent messages within both a message-count cap and a character
+    budget, preserving the latest user turn.
+    """
+    windowed = history[-WEB_CHAT_MAX_HISTORY_MESSAGES:] if WEB_CHAT_MAX_HISTORY_MESSAGES > 0 else list(history)
+    if WEB_CHAT_CONTEXT_WINDOW <= 0:
+        return windowed
+    kept: List[Dict[str, str]] = []
+    used = 0
+    # Walk newest-first, accumulating until the character budget is hit; always keep
+    # at least the most recent message.
+    for msg in reversed(windowed):
+        size = len(msg.get("content") or "")
+        if kept and used + size > WEB_CHAT_CONTEXT_WINDOW:
+            break
+        kept.append(msg)
+        used += size
+    kept.reverse()
+    return kept
+
+
+def _build_story_so_far(history: List[Dict[str, str]]) -> str:
+    """Assemble the prior story prose from assistant messages for the repetition guard."""
+    parts = [
+        (m.get("content") or "").strip()
+        for m in history
+        if m.get("role") == "assistant" and (m.get("content") or "").strip()
+    ]
+    return "\n\n".join(parts)
 
 
 def _is_port_open(host: str, port: int) -> bool:
@@ -350,15 +450,26 @@ def _build_client() -> OpenAI:
     )
 
 
-def _generate_story_reply(history: List[Dict[str, str]]) -> str:
+def _generate_story_reply(history: List[Dict[str, str]], extra_avoid_block: str = "") -> str:
     agent_config = get_config()
     model = agent_config["config_list"][0]["model"]
     client = _build_client()
+
+    system_content = SYSTEM_PROMPT
+    if extra_avoid_block.strip():
+        system_content = SYSTEM_PROMPT + "\n\n" + extra_avoid_block.strip()
+
+    # Window the raw chat history so the context sent to the model stays bounded
+    # regardless of how long the conversation grows.
+    windowed = _window_history(history)
+
     response = client.chat.completions.create(
         model=model,
-        messages=[{"role": "system", "content": SYSTEM_PROMPT}, *history],
+        messages=[{"role": "system", "content": system_content}, *windowed],
         temperature=0.85,
         max_tokens=WEB_CHAT_MAX_TOKENS,
+        frequency_penalty=WEB_CHAT_FREQUENCY_PENALTY,
+        presence_penalty=WEB_CHAT_PRESENCE_PENALTY,
     )
     return response.choices[0].message.content or ""
 
@@ -376,26 +487,84 @@ def index():
 @app.post("/api/chat")
 def chat():
     payload = request.get_json(silent=True) or {}
-    message = (payload.get("message") or "").strip()
+    raw_message = payload.get("message")
+    if not isinstance(raw_message, str):
+        return jsonify({"error": "Message must be text."}), 400
+    message = raw_message.strip()
     if not message:
         return jsonify({"error": "Message cannot be empty."}), 400
+    if len(message) > WEB_CHAT_MAX_MESSAGE_CHARS:
+        return (
+            jsonify({"error": f"Message too long (max {WEB_CHAT_MAX_MESSAGE_CHARS} characters)."}),
+            413,
+        )
 
     session_id = _get_session_id()
+    _touch_session(session_id)
     history = CHAT_SESSIONS.setdefault(session_id, [])
     history.append({"role": "user", "content": message})
+    # Keep the retained history bounded so memory per session cannot grow without limit.
+    if WEB_CHAT_MAX_HISTORY_MESSAGES > 0 and len(history) > WEB_CHAT_MAX_HISTORY_MESSAGES:
+        del history[: len(history) - WEB_CHAT_MAX_HISTORY_MESSAGES]
 
     try:
-        reply = _generate_story_reply(history)
+        # --- cross-response repetition guard + long-form memory ---------------
+        # Mine overused phrasings from the assembled story-so-far, add an
+        # anti-repetition directive, and regenerate if the continuation recycles
+        # too much of the prior prose (mirrors app_gradio.py).
+        current_story = _build_story_so_far(history)
+        guard_on = rg.GUARD_ENABLED and bool(current_story.strip())
+        overused = rg.extract_overused_phrases(current_story) if guard_on else []
+        # Trim the story-so-far for ratio/longform comparisons so the guard work also
+        # stays bounded on very long conversations.
+        story_for_guard = _trim_text(current_story, max(WEB_CHAT_CONTEXT_WINDOW * 4, 1)) if guard_on else ""
+        directive_cjk = not any(
+            "english" in str(h.get("content", "")).lower() for h in history if h.get("role") == "user"
+        )
+
+        avoid_block = rg.build_avoid_directive(overused, cjk=directive_cjk) if guard_on else ""
+        reply = _generate_story_reply(history, avoid_block)
+
+        if guard_on:
+            best_reply = reply
+            best_ratio = rg.repetition_ratio(reply, story_for_guard)
+            attempts = 0
+            while best_ratio > rg.RATIO_THRESHOLD and attempts < rg.MAX_RETRIES:
+                attempts += 1
+                recycled = rg.repeated_spans(reply, story_for_guard)
+                retry_block = rg.build_avoid_directive(overused, recycled, cjk=directive_cjk)
+                reply = _generate_story_reply(history, retry_block)
+                ratio = rg.repetition_ratio(reply, story_for_guard)
+                if ratio < best_ratio:
+                    best_reply, best_ratio = reply, ratio
+            reply = best_reply
+
         history.append({"role": "assistant", "content": reply})
+        if WEB_CHAT_MAX_HISTORY_MESSAGES > 0 and len(history) > WEB_CHAT_MAX_HISTORY_MESSAGES:
+            del history[: len(history) - WEB_CHAT_MAX_HISTORY_MESSAGES]
         return jsonify({"reply": reply})
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": str(exc)}), 500
+    except Exception:  # noqa: BLE001
+        # Log full detail server-side; never leak raw exception text to the client.
+        request_id = uuid.uuid4().hex[:12]
+        logger.exception("Error in /api/chat (request_id=%s)", request_id)
+        return (
+            jsonify(
+                {
+                    "error": "An error occurred while generating the story. Please try again.",
+                    "request_id": request_id,
+                }
+            ),
+            500,
+        )
 
 
 @app.post("/api/reset")
 def reset():
     session_id = _get_session_id()
-    CHAT_SESSIONS[session_id] = []
+    # Actually free the in-memory history on reset rather than leaving an empty list.
+    with _SESSIONS_LOCK:
+        CHAT_SESSIONS.pop(session_id, None)
+        SESSION_LAST_ACCESS.pop(session_id, None)
     return jsonify({"ok": True})
 
 

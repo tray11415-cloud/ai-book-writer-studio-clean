@@ -29,6 +29,7 @@ from env_utils import get_dotenv_path
 from lora_runtime import LORA_BASE_URL, LORA_MODEL_NAME, ensure_lora_server_running, is_lora_base_url
 from plot_ideation_skill import DEFAULT_PLOT_GOAL
 from plot_ideation_skill import generate_plot_ideation
+import repetition_guard as rg
 from scene_technique_skill import DEFAULT_LIBRARY_GOAL, DEFAULT_TECHNIQUE_GOAL
 from scene_technique_skill import aggregate_scene_techniques
 from scene_technique_skill import distill_novel_to_technique_finder
@@ -145,10 +146,32 @@ DIRECTOR_PRESETS = [
 ]
 
 def trim_text(text, max_chars):
+    # Python 3 str slicing counts Unicode code points, so text[-max_chars:] is
+    # safe for CJK (it never splits a multi-byte character). We only need to
+    # guard against None/invalid inputs here.
     text = (text or "").strip()
+    try:
+        max_chars = int(max_chars)
+    except (TypeError, ValueError):
+        return text
     if max_chars <= 0 or len(text) <= max_chars:
         return text
     return text[-max_chars:]
+
+
+def _clamp_weight(value, low: float = 0.5, high: float = 1.5, default: float = 1.0) -> float:
+    """Clamp a sensory weight into [low, high] and coerce bad/NaN input to default.
+
+    Sensory weights are formatted directly into the system prompt; this keeps that
+    text well-formed even if a caller bypasses the Gradio slider bounds.
+    """
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return default
+    if num != num:  # NaN
+        return default
+    return max(low, min(high, num))
 
 
 def ensure_proxy_running() -> None:
@@ -249,16 +272,20 @@ def model_config_payload(
     lora_base_url,
     lora_model,
 ) -> dict[str, Any]:
+    # SECURITY: never persist API keys to disk. book_output/model_config.json is
+    # an untracked file that can easily be zipped/shared/committed, which would
+    # leak the user's keys. Only non-sensitive config (base_url, model, pipeline)
+    # is stored; keys are loaded at runtime from the environment / UI textboxes.
+    # (writing_api_key / analysis_api_key are accepted for signature stability but
+    # intentionally not written.)
     return {
         "saved_at": datetime.now().isoformat(timespec="seconds"),
         "writing": {
-            "api_key": writing_api_key or "",
             "base_url": writing_base_url or "",
             "model": writing_model or "",
             "pipeline": pipeline_mode or PIPELINE_HYBRID,
         },
         "analysis": {
-            "api_key": analysis_api_key or "",
             "base_url": analysis_base_url or "",
             "model": analysis_model or "",
         },
@@ -292,8 +319,16 @@ def save_model_config(
         lora_model,
     )
     path = get_model_config_path()
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return f"[OK] Model config saved: {path}"
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logging.exception("Failed to save model config.")
+        return f"[ERROR] Could not save model config: {exc}"
+    return (
+        f"[OK] Model config saved (no API keys stored): {path}\n"
+        "Note: API keys are NOT written to disk. Re-enter keys or set them via "
+        "environment variables; only base URLs / model names are persisted."
+    )
 
 
 def load_model_config():
@@ -311,21 +346,38 @@ def load_model_config():
             DEFAULT_LORA_MODEL,
             f"[INFO] No saved model config found. Using defaults: {path}",
         )
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        logging.exception("Failed to load model config.")
+        return (
+            DEFAULT_API_KEY,
+            DEFAULT_BASE_URL,
+            DEFAULT_MODEL,
+            PIPELINE_HYBRID,
+            DEFAULT_ANALYSIS_API_KEY,
+            DEFAULT_ANALYSIS_BASE_URL,
+            DEFAULT_ANALYSIS_MODEL,
+            DEFAULT_LORA_BASE_URL,
+            DEFAULT_LORA_MODEL,
+            f"[ERROR] Could not read model config ({exc}); using defaults.",
+        )
     writing = payload.get("writing", {})
     analysis = payload.get("analysis", {})
     lora = payload.get("lora", {})
+    # API keys are never persisted (see model_config_payload); always source them
+    # from the environment-backed defaults instead of disk.
     return (
-        writing.get("api_key", DEFAULT_API_KEY),
+        DEFAULT_API_KEY,
         writing.get("base_url", DEFAULT_BASE_URL),
         writing.get("model", DEFAULT_MODEL),
         writing.get("pipeline", PIPELINE_HYBRID),
-        analysis.get("api_key", DEFAULT_ANALYSIS_API_KEY),
+        DEFAULT_ANALYSIS_API_KEY,
         analysis.get("base_url", DEFAULT_ANALYSIS_BASE_URL),
         analysis.get("model", DEFAULT_ANALYSIS_MODEL),
         lora.get("base_url", DEFAULT_LORA_BASE_URL),
         lora.get("model", DEFAULT_LORA_MODEL),
-        f"[OK] Model config loaded: {path}",
+        f"[OK] Model config loaded (API keys from environment): {path}",
     )
 
 
@@ -354,7 +406,13 @@ def autosave_generation(
     thought: str,
     request_payload: dict[str, Any],
     response_payload: Any,
-) -> None:
+) -> tuple[bool, str]:
+    """Persist generation artifacts. Returns (success, error_msg).
+
+    Each write is guarded independently so one failure (disk full, permissions)
+    does not abort the rest. On any failure success=False and error_msg names the
+    artifacts that could not be written, so the caller can surface it to the user.
+    """
     timestamp = datetime.now()
     stamp = timestamp.strftime("%Y%m%d_%H%M%S")
     output_dir = get_book_output_dir()
@@ -369,17 +427,34 @@ def autosave_generation(
     thought_path = log_dir / f"thought_{stamp}.txt"
     jsonl_path = log_dir / "request_response_log.jsonl"
 
-    latest_story_path.write_text(updated_story, encoding="utf-8")
-    snapshot_story_path.write_text(updated_story, encoding="utf-8")
-    latest_part_path.write_text(new_part, encoding="utf-8")
-    snapshot_part_path.write_text(new_part, encoding="utf-8")
-    thought_path.write_text(thought, encoding="utf-8")
+    failures: list[str] = []
+
+    def _write(label: str, path: Path, data: str) -> None:
+        try:
+            path.write_text(data, encoding="utf-8")
+        except OSError:
+            logging.exception("Autosave failed for %s (%s)", label, path)
+            failures.append(label)
+
+    _write("latest_story", latest_story_path, updated_story)
+    _write("snapshot_story", snapshot_story_path, updated_story)
+    _write("latest_continuation", latest_part_path, new_part)
+    _write("snapshot_continuation", snapshot_part_path, new_part)
+    _write("thought", thought_path, thought)
 
     serialized_request = serialize_for_log(request_payload)
     serialized_response = serialize_for_log(response_payload)
 
-    request_path.write_text(json.dumps(serialized_request, ensure_ascii=False, indent=2), encoding="utf-8")
-    response_path.write_text(json.dumps(serialized_response, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write(
+        "request_json",
+        request_path,
+        json.dumps(serialized_request, ensure_ascii=False, indent=2),
+    )
+    _write(
+        "response_json",
+        response_path,
+        json.dumps(serialized_response, ensure_ascii=False, indent=2),
+    )
 
     log_entry = {
         "saved_at": timestamp.isoformat(timespec="seconds"),
@@ -393,17 +468,27 @@ def autosave_generation(
         "request": serialized_request,
         "response": serialized_response,
     }
-    with jsonl_path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    try:
+        with jsonl_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except OSError:
+        logging.exception("Autosave failed for jsonl_log (%s)", jsonl_path)
+        failures.append("jsonl_log")
+
+    if failures:
+        return False, "Could not write: " + ", ".join(failures)
+    return True, ""
 
 
 def fetch_all_models(api_key, base_url):
     try:
         client = get_client(api_key, base_url)
-        models = sorted({item.id for item in client.models.list().data if getattr(item, "id", None)})
+        data = getattr(client.models.list(), "data", []) or []
+        models = sorted({item.id for item in data if getattr(item, "id", None)})
         if not models:
             models = [DEFAULT_MODEL]
     except Exception:
+        logging.exception("Failed to fetch models list from %s", base_url)
         models = [DEFAULT_MODEL]
     return gr.update(choices=models, value=models[0] if models else DEFAULT_MODEL)
 
@@ -422,7 +507,8 @@ def test_api_connection(api_key, base_url, model_name):
         content = (response.choices[0].message.content or "").strip()
         return f"[OK] Connected.\nModel: {model_name}\nReply: {content}"
     except Exception as exc:
-        return f"[ERROR] {exc}"
+        logging.exception("API connection test failed for model %s at %s", model_name, base_url)
+        return f"[ERROR] Connection failed: {exc}"
 
 
 def add_empty_row(data, width):
@@ -531,6 +617,8 @@ def build_story_prompt(
     technique_library,
     sensory_values,
     context_length,
+    extra_avoid_block: str = "",
+    longform_memory: str = "",
 ):
     director_note = build_director_note(custom_director)
     style_instruction = infer_style_instruction(style_name, custom_style)
@@ -569,6 +657,9 @@ def build_story_prompt(
         system_parts.append(f"Prefer these motifs or words when natural: {focus_words.strip()}")
     if avoid_words.strip():
         system_parts.append(f"Avoid these words or motifs when possible: {avoid_words.strip()}")
+    if extra_avoid_block.strip():
+        # High-priority cross-response anti-repetition rule (mined from the whole story).
+        system_parts.append(extra_avoid_block.strip())
 
     instruction_text = instruction.strip() or "Continue the story naturally, advancing the most recent scene."
     user_parts = []
@@ -578,6 +669,11 @@ def build_story_prompt(
         + instruction_text
     )
     # 2) Continuity input.
+    if longform_memory.strip():
+        user_parts.append(
+            "Earlier Story Digest (events from before the recent context window — keep them "
+            "consistent; do NOT re-describe or contradict them):\n" + longform_memory.strip()
+        )
     if recent_story:
         user_parts.append(f"Recent Story Context (continuity only — continue naturally from here):\n{recent_story}")
     # 3) Low-priority reference.
@@ -586,6 +682,9 @@ def build_story_prompt(
             "Low-priority reference. Use only for consistency, and ignore anything that conflicts with the Story Instruction or the current scene:\n"
             + reference_context
         )
+    # 3b) Cross-response anti-repetition ban, restated near the end for recency.
+    if extra_avoid_block.strip():
+        user_parts.append(extra_avoid_block.strip())
     # 4) Restate the instruction last so it stays the dominant directive (recency).
     user_parts.append(
         "=== WRITE NOW ===\n"
@@ -623,7 +722,12 @@ def get_message_content(response: Any) -> str:
     choices = getattr(response, "choices", None)
     if not choices:
         raise RuntimeError(f"Upstream response contained no choices: {response!r}"[:300])
-    return (choices[0].message.content or "").strip()
+    content = (getattr(choices[0].message, "content", None) or "").strip()
+    if not content:
+        # An empty body silently appended to the story creates confusing gaps;
+        # fail loudly instead so the caller can surface / fall back.
+        raise RuntimeError(f"Upstream response contained no message content: {response!r}"[:300])
+    return content
 
 
 def generate_direct_response(
@@ -685,15 +789,22 @@ def generate_hybrid_continuation(
             ),
         },
     ]
-    plan_response = generate_direct_response(
-        client=remote_client,
-        model_name=remote_model,
-        messages=planner_messages,
-        temperature=min(float(temperature), 0.75),
-        top_p=top_p,
-        max_tokens=min(max(max_tokens // 3, 800), BOOK_WRITER_PLAN_MAX_TOKENS),
-    )
-    plan = get_message_content(plan_response)
+    stage_errors: list[str] = []
+    plan_response: Any = None
+    try:
+        plan_response = generate_direct_response(
+            client=remote_client,
+            model_name=remote_model,
+            messages=planner_messages,
+            temperature=min(float(temperature), 0.75),
+            top_p=top_p,
+            max_tokens=min(max(max_tokens // 3, 800), BOOK_WRITER_PLAN_MAX_TOKENS),
+        )
+        plan = get_message_content(plan_response)
+    except Exception as exc:
+        logging.exception("Hybrid pipeline planner stage failed.")
+        stage_errors.append(f"planner: {exc}")
+        plan = ""
 
     lora_client = get_client("not-needed", lora_base_url or DEFAULT_LORA_BASE_URL)
     lora_messages = [
@@ -717,17 +828,24 @@ def generate_hybrid_continuation(
             ),
         },
     ]
-    draft_response = generate_direct_response(
-        client=lora_client,
-        model_name=lora_model or DEFAULT_LORA_MODEL,
-        messages=lora_messages,
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=max_tokens,
-        freq_penalty=freq_penalty,
-        pres_penalty=pres_penalty,
-    )
-    draft = get_message_content(draft_response)
+    draft_response: Any = None
+    try:
+        draft_response = generate_direct_response(
+            client=lora_client,
+            model_name=lora_model or DEFAULT_LORA_MODEL,
+            messages=lora_messages,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            freq_penalty=freq_penalty,
+            pres_penalty=pres_penalty,
+        )
+        draft = get_message_content(draft_response)
+    except Exception as exc:
+        logging.exception("Hybrid pipeline drafter stage failed.")
+        stage_errors.append(f"drafter: {exc}")
+        # Fall back to the plan as the draft so the user still gets usable output.
+        draft = plan
 
     editor_messages = [
         {
@@ -751,17 +869,33 @@ def generate_hybrid_continuation(
             ),
         },
     ]
-    polish_response = generate_direct_response(
-        client=remote_client,
-        model_name=remote_model,
-        messages=editor_messages,
-        temperature=min(float(temperature), 0.8),
-        top_p=top_p,
-        max_tokens=max_tokens,
-        freq_penalty=freq_penalty,
-        pres_penalty=pres_penalty,
-    )
-    final_text = get_message_content(polish_response) or draft
+    polish_response: Any = None
+    try:
+        polish_response = generate_direct_response(
+            client=remote_client,
+            model_name=remote_model,
+            messages=editor_messages,
+            temperature=min(float(temperature), 0.8),
+            top_p=top_p,
+            max_tokens=max_tokens,
+            freq_penalty=freq_penalty,
+            pres_penalty=pres_penalty,
+        )
+        final_text = get_message_content(polish_response)
+    except Exception as exc:
+        logging.exception("Hybrid pipeline polish stage failed.")
+        stage_errors.append(f"polish: {exc}")
+        # Fall back to the (unpolished) draft so generation still returns prose.
+        final_text = draft
+
+    if not (final_text or "").strip():
+        # Every stage degraded to empty; make the failure explicit rather than
+        # silently appending nothing to the story.
+        raise RuntimeError(
+            "Hybrid pipeline produced no text. " + "; ".join(stage_errors)
+            if stage_errors
+            else "Hybrid pipeline produced no text."
+        )
     response_payload = {
         "pipeline": PIPELINE_HYBRID,
         "remote_model": remote_model,
@@ -772,8 +906,12 @@ def generate_hybrid_continuation(
         "plan_response": plan_response,
         "draft_response": draft_response,
         "polish_response": polish_response,
+        "stage_errors": stage_errors,
     }
-    thought_extra = "\n\nHybrid pipeline:\n- NALANG planned the scene.\n- Local LoRA wrote the prose draft.\n- NALANG polished continuity and flow.\n\nScene plan:\n" + plan
+    thought_extra = "\n\nHybrid pipeline:\n- NALANG planned the scene.\n- Local LoRA wrote the prose draft.\n- NALANG polished continuity and flow."
+    if stage_errors:
+        thought_extra += "\n[WARNING] Some stages degraded gracefully: " + "; ".join(stage_errors)
+    thought_extra += "\n\nScene plan:\n" + plan
     return final_text, response_payload, thought_extra
 
 
@@ -820,121 +958,217 @@ def generate_continuation(
     lora_model,
     history_state=None,
 ):
+    # Validate user-supplied numerics. Gradio sliders normally clamp these, but a
+    # programmatic / API caller can bypass the UI bounds. Return the standard
+    # 4-tuple with an error in the "thought" slot so Gradio surfaces it cleanly
+    # rather than crashing on a malformed API payload. (Order matches the .click
+    # outputs: full_story_box, state_history, latest_output, thought_output.)
+    numeric_checks = [
+        ("max_tokens", max_tokens, 1, BOOK_WRITER_MAX_TOKENS),
+        ("context_length", context_length, 1, None),
+        ("temperature", temperature, 0.0, 2.0),
+        ("top_p", top_p, 0.0, 1.0),
+        ("frequency_penalty", freq_penalty, -2.0, 2.0),
+        ("presence_penalty", pres_penalty, -2.0, 2.0),
+    ]
+    for name, value, low, high in numeric_checks:
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return current_story or "", list(history_state or []), "", f"[ERROR] Validation: {name} is not a number."
+        if num != num:  # NaN
+            return current_story or "", list(history_state or []), "", f"[ERROR] Validation: {name} is not a valid number."
+        if low is not None and num < low:
+            return current_story or "", list(history_state or []), "", f"[ERROR] Validation: {name}={num} is below the minimum {low}."
+        if high is not None and num > high:
+            return current_story or "", list(history_state or []), "", f"[ERROR] Validation: {name}={num} is above the maximum {high}."
+
     ensure_proxy_running()
-    client = get_client(api_key, base_url)
-    system_prompt, user_prompt, thought = build_story_prompt(
-        background=background,
-        roles=roles,
-        lore=lore,
-        memory=memory,
-        current_story=current_story,
-        instruction=instruction,
-        style_name=style_name,
-        custom_style=custom_style,
-        pov=pov,
-        ling_texture=ling_texture,
-        pacing=pacing,
-        intensity=intensity,
-        output_lang=output_lang,
-        para_density=para_density,
-        dialogue_ratio=dialogue_ratio,
-        focus_words=focus_words,
-        avoid_words=avoid_words,
-        custom_director=custom_director,
-        style_dna=style_dna,
-        style_samples=style_samples,
-        chronicle=chronicle,
-        technique_library=technique_library,
-        sensory_values={
-            "visual": v_weight,
-            "auditory": a_weight,
-            "olfactory": o_weight,
-            "tactile": t_weight,
-            "gustatory": g_weight,
-        },
-        context_length=int(context_length),
+    try:
+        client = get_client(api_key, base_url)
+    except Exception as exc:
+        logging.exception("Failed to initialize API client.")
+        return current_story or "", list(history_state or []), "", f"[ERROR] Could not connect to the model provider: {exc}"
+
+    # --- cross-response repetition guard + long-form memory -------------------
+    # Mine the model's overused phrasings from the WHOLE story (not just the recent
+    # window) and digest earlier content that has scrolled out of context, so each
+    # new continuation is steered away from recycling and keeps long-range continuity.
+    guard_on = rg.GUARD_ENABLED and bool((current_story or "").strip())
+    overused_phrases = rg.extract_overused_phrases(current_story) if guard_on else []
+    longform_memory = (
+        rg.build_longform_memory(current_story, int(context_length)) if guard_on else ""
     )
-    if system_prompt_override.strip():
-        system_prompt = system_prompt_override.strip() + "\n\n" + system_prompt
+    directive_cjk = output_lang != "English"
 
-    request_payload = {
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
-        "model": model_name,
-        "base_url": base_url,
-        "generation_params": {
-            "pipeline_mode": pipeline_mode,
-            "lora_base_url": lora_base_url,
-            "lora_model": lora_model,
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_tokens": max_tokens,
-            "frequency_penalty": freq_penalty,
-            "presence_penalty": pres_penalty,
-            "context_length": int(context_length),
-        },
-        "story_controls": {
-            "style_name": style_name,
-            "custom_style": custom_style,
-            "pov": pov,
-            "ling_texture": ling_texture,
-            "pacing": pacing,
-            "intensity": intensity,
-            "output_lang": output_lang,
-            "para_density": para_density,
-            "dialogue_ratio": dialogue_ratio,
-            "focus_words": focus_words,
-            "avoid_words": avoid_words,
-            "custom_director": custom_director,
-            "technique_library_chars": len(technique_library or ""),
-        },
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-
-    if pipeline_mode == PIPELINE_HYBRID:
-        new_part, response, thought_extra = generate_hybrid_continuation(
-            remote_client=client,
-            remote_model=model_name,
-            lora_base_url=lora_base_url,
-            lora_model=lora_model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
+    def _run(extra_avoid_block: str):
+        system_prompt, user_prompt, thought = build_story_prompt(
+            background=background,
+            roles=roles,
+            lore=lore,
+            memory=memory,
+            current_story=current_story,
             instruction=instruction,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=int(max_tokens),
-            freq_penalty=freq_penalty,
-            pres_penalty=pres_penalty,
+            style_name=style_name,
+            custom_style=custom_style,
+            pov=pov,
+            ling_texture=ling_texture,
+            pacing=pacing,
+            intensity=intensity,
+            output_lang=output_lang,
+            para_density=para_density,
+            dialogue_ratio=dialogue_ratio,
+            focus_words=focus_words,
+            avoid_words=avoid_words,
+            custom_director=custom_director,
+            style_dna=style_dna,
+            style_samples=style_samples,
+            chronicle=chronicle,
+            technique_library=technique_library,
+            sensory_values={
+                "visual": _clamp_weight(v_weight),
+                "auditory": _clamp_weight(a_weight),
+                "olfactory": _clamp_weight(o_weight),
+                "tactile": _clamp_weight(t_weight),
+                "gustatory": _clamp_weight(g_weight),
+            },
+            context_length=int(context_length),
+            extra_avoid_block=extra_avoid_block,
+            longform_memory=longform_memory,
         )
-        thought += thought_extra
-    else:
-        response = generate_direct_response(
-            client=client,
-            model_name=model_name,
-            messages=request_payload["messages"],
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            freq_penalty=freq_penalty,
-            pres_penalty=pres_penalty,
-        )
-        new_part = get_message_content(response)
+        if system_prompt_override.strip():
+            system_prompt = system_prompt_override.strip() + "\n\n" + system_prompt
+
+        request_payload = {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "model": model_name,
+            "base_url": base_url,
+            "generation_params": {
+                "pipeline_mode": pipeline_mode,
+                "lora_base_url": lora_base_url,
+                "lora_model": lora_model,
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_tokens": max_tokens,
+                "frequency_penalty": freq_penalty,
+                "presence_penalty": pres_penalty,
+                "context_length": int(context_length),
+            },
+            "story_controls": {
+                "style_name": style_name,
+                "custom_style": custom_style,
+                "pov": pov,
+                "ling_texture": ling_texture,
+                "pacing": pacing,
+                "intensity": intensity,
+                "output_lang": output_lang,
+                "para_density": para_density,
+                "dialogue_ratio": dialogue_ratio,
+                "focus_words": focus_words,
+                "avoid_words": avoid_words,
+                "custom_director": custom_director,
+                "technique_library_chars": len(technique_library or ""),
+            },
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+
+        if pipeline_mode == PIPELINE_HYBRID:
+            new_part, response, thought_extra = generate_hybrid_continuation(
+                remote_client=client,
+                remote_model=model_name,
+                lora_base_url=lora_base_url,
+                lora_model=lora_model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                instruction=instruction,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=int(max_tokens),
+                freq_penalty=freq_penalty,
+                pres_penalty=pres_penalty,
+            )
+            thought += thought_extra
+        else:
+            response = generate_direct_response(
+                client=client,
+                model_name=model_name,
+                messages=request_payload["messages"],
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                freq_penalty=freq_penalty,
+                pres_penalty=pres_penalty,
+            )
+            new_part = get_message_content(response)
+        return new_part, response, request_payload, thought
+
+    first_avoid_block = (
+        rg.build_avoid_directive(overused_phrases, cjk=directive_cjk) if guard_on else ""
+    )
+    # The whole generation path hits the network; surface any failure as a clean
+    # message in the standard 4-tuple instead of crashing the Gradio callback.
+    try:
+        new_part, response, request_payload, thought = _run(first_avoid_block)
+
+        if guard_on:
+            # Measure how much of this continuation recycles earlier phrasing, and if it is
+            # over the threshold, regenerate with the offending spans explicitly banned.
+            best = (new_part, response, request_payload, thought)
+            best_ratio = rg.repetition_ratio(new_part, current_story)
+            attempts = 0
+            failed_retries = 0
+            while best_ratio > rg.RATIO_THRESHOLD and attempts < rg.MAX_RETRIES:
+                attempts += 1
+                recycled = rg.repeated_spans(new_part, current_story)
+                retry_block = rg.build_avoid_directive(
+                    overused_phrases, recycled, cjk=directive_cjk
+                )
+                try:
+                    new_part, response, request_payload, thought = _run(retry_block)
+                except Exception as exc:
+                    # A failed retry should not lose the best-so-far result.
+                    logging.warning("Repetition-guard retry %s failed: %s", attempts, exc)
+                    failed_retries += 1
+                    continue
+                ratio = rg.repetition_ratio(new_part, current_story)
+                if ratio < best_ratio:
+                    best = (new_part, response, request_payload, thought)
+                    best_ratio = ratio
+            new_part, response, request_payload, thought = best
+            thought += (
+                f"\n\nRepetition guard: overlap with prior story = {best_ratio:.0%} "
+                f"(threshold {rg.RATIO_THRESHOLD:.0%}); regenerations used = {attempts}; "
+                f"overused phrasings banned = {len(overused_phrases)}; "
+                f"earlier-memory digest = {'on' if longform_memory else 'off'}."
+            )
+            if failed_retries:
+                thought += f" ({failed_retries} retry attempt(s) errored and were skipped.)"
+    except Exception as exc:
+        logging.exception("Generation failed.")
+        return current_story or "", list(history_state or []), "", f"[ERROR] Generation failed: {exc}"
+
     updated_story = (current_story.strip() + "\n\n" + new_part).strip() if current_story.strip() else new_part
     updated_history = list(history_state or [])
     updated_history.append(current_story or "")
     latest_output = new_part
     try:
-        autosave_generation(
+        ok, autosave_err = autosave_generation(
             updated_story=updated_story,
             new_part=new_part,
             thought=thought,
             request_payload=request_payload,
             response_payload=response,
         )
-    except Exception:
+    except Exception as exc:
         logging.exception("Failed to autosave generation artifacts.")
+        ok, autosave_err = False, str(exc)
+    if not ok:
+        # Generation succeeded but persistence did not — tell the user so they can
+        # save manually instead of assuming their work is on disk.
+        thought += f"\n\n[WARNING] Autosave failed: {autosave_err}. Consider saving the project manually."
     return updated_story, updated_history, latest_output, thought
 
 
@@ -983,7 +1217,15 @@ def load_project(file_obj):
     if file_obj is None:
         return "", [["", "", ""]], [["", ""]], "", "", "", "", "", ""
     file_path = getattr(file_obj, "name", file_obj)
-    payload = json.loads(Path(file_path).read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(Path(file_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        logging.exception("Failed to load project file: %s", file_path)
+        # Reset to empty defaults so the UI stays responsive on a bad file.
+        return "", [["", "", ""]], [["", ""]], "", "", "", "", "", ""
+    if not isinstance(payload, dict):
+        logging.error("Project file did not contain a JSON object: %s", file_path)
+        return "", [["", "", ""]], [["", ""]], "", "", "", "", "", ""
     return (
         payload.get("background", ""),
         payload.get("roles", [["", "", ""]]) or [["", "", ""]],
@@ -1021,13 +1263,17 @@ FEW_SHOT:
 
 Samples:
 {chr(10).join(excerpts)}"""
-    client = get_client(api_key, base_url)
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-        max_tokens=1200,
-    )
+    try:
+        client = get_client(api_key, base_url)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=1200,
+        )
+    except Exception as exc:
+        logging.exception("analyze_style_dna API call failed.")
+        return f"[ERROR] Style analysis failed: {exc}", ""
     content = (response.choices[0].message.content or "").strip()
     dna_match = re.search(r"STYLE_DNA:\s*(.*?)(?:FEW_SHOT:|$)", content, re.S)
     shot_match = re.search(r"FEW_SHOT:\s*(.*)$", content, re.S)
@@ -1060,13 +1306,17 @@ Create a story chronicle with these sections:
 
 Source material:
 {chr(10).join(excerpts)}"""
-    client = get_client(api_key, base_url)
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.9,
-        max_tokens=1800,
-    )
+    try:
+        client = get_client(api_key, base_url)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.9,
+            max_tokens=1800,
+        )
+    except Exception as exc:
+        logging.exception("analyze_story_chronicle API call failed.")
+        return f"[ERROR] Chronicle analysis failed: {exc}"
     return (response.choices[0].message.content or "").strip()
 
 
@@ -1103,13 +1353,17 @@ Instruction: {instruction or 'Preserve meaning but improve style and readability
 
 Target text:
 {target_text}"""
-    client = get_client(api_key, base_url)
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.8,
-        max_tokens=min(max(target_length // 2, 800), BOOK_WRITER_REWRITE_MAX_TOKENS),
-    )
+    try:
+        client = get_client(api_key, base_url)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.8,
+            max_tokens=min(max(int(target_length) // 2, 800), BOOK_WRITER_REWRITE_MAX_TOKENS),
+        )
+    except Exception as exc:
+        logging.exception("rewrite_with_style API call failed.")
+        return f"[ERROR] Rewrite failed: {exc}"
     return (response.choices[0].message.content or "").strip()
 
 
@@ -1346,7 +1600,7 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
                     book_source_paths = gr.Textbox(
                         label="Add File / Folder Paths (one per line)",
                         lines=4,
-                        placeholder=r"C:\path\to\full_report.md",
+                        placeholder=r"C:\Users\User\Downloads\full_report (1).md",
                     )
                     book_pasted_label = gr.Textbox(label="Pasted Source Label", placeholder="例如：風華神女錄技法報告、某本小說片段")
                     book_pasted_source = gr.Textbox(label="Pasted Source Text", lines=8)
@@ -1601,7 +1855,7 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
         gr.Markdown("Use the fields below when you want a focused sheet for one exact scene/action/situation.")
         with gr.Row():
             with gr.Column(scale=3):
-                technique_scene_input = gr.Textbox(label="Specific Scene", lines=2, placeholder="王城正殿、雨夜城門、破敗藥鋪、密室審問...")
+                technique_scene_input = gr.Textbox(label="Specific Scene", lines=2, placeholder="寒宮正殿、雨夜城門、破敗藥鋪、密室審問...")
                 technique_action_input = gr.Textbox(label="Specific Action", lines=2, placeholder="侍女接近昏迷者、拔劍、遞信、跪拜、暗中下毒...")
                 technique_situation_input = gr.Textbox(label="Specific Situation", lines=3, placeholder="祕密刺殺前、久別重逢卻不能相認、真相即將暴露、權力壓迫...")
                 technique_effect_input = gr.Textbox(label="Desired Reader Effect", lines=2, placeholder="壓迫、曖昧、危險、悲涼、懸疑、莊嚴、失控...")
@@ -1633,7 +1887,7 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
                     report_distill_file = gr.File(label="full_report.md", file_count="single", file_types=[".md", ".txt", ".json"])
                     report_distill_path = gr.Textbox(
                         label="full_report Path",
-                        placeholder=r"C:\path\to\full_report.md",
+                        placeholder=r"C:\Users\User\Downloads\full_report (1).md",
                     )
                     report_distill_text = gr.Textbox(label="Pasted full_report Text", lines=8)
                     report_distill_goal = gr.Textbox(label="/goal", value=DEFAULT_REPORT_DISTILL_GOAL, lines=3)
@@ -1666,7 +1920,7 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
             review_max_chars_input = gr.Number(label="Preview Chars", value=22000, precision=0)
         review_custom_path_input = gr.Textbox(
             label="Custom Markdown / JSON Path",
-            placeholder=r"C:\path\to\full_report.md",
+            placeholder=r"C:\Users\User\Downloads\full_report (1).md",
         )
         review_btn = gr.Button("Review Skill / Technique", variant="primary")
         review_status = gr.Textbox(label="Review Status", lines=7, interactive=False)

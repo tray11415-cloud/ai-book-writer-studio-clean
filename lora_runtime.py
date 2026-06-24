@@ -49,28 +49,53 @@ def ensure_lora_server_running(wait_seconds: float = 2.0) -> None:
     log_path = log_dir / "lora_openai_server.log"
 
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
-    log_handle = log_path.open("ab")
-    subprocess.Popen(
-        [
-            str(LORA_VENV_PYTHON),
-            str(LORA_SERVER_SCRIPT),
-            "--host",
-            LORA_HOST,
-            "--port",
-            str(LORA_PORT),
-            "--adapter",
-            str(LORA_ADAPTER_DIR),
-            "--model-name",
-            LORA_MODEL_NAME,
-        ],
-        cwd=str(PROJECT_ROOT),
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-        creationflags=creationflags,
-    )
+    print(f"Starting LoRA server; logs at {log_path}")
+    # Open the log via a context manager so the parent's handle is always closed.
+    # Popen duplicates the underlying OS file descriptor for the child, so the
+    # subprocess keeps writing to the log after the parent closes its reference.
+    with log_path.open("ab") as log_handle:
+        process = subprocess.Popen(
+            [
+                str(LORA_VENV_PYTHON),
+                str(LORA_SERVER_SCRIPT),
+                "--host",
+                LORA_HOST,
+                "--port",
+                str(LORA_PORT),
+                "--adapter",
+                str(LORA_ADAPTER_DIR),
+                "--model-name",
+                LORA_MODEL_NAME,
+            ],
+            cwd=str(PROJECT_ROOT),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+        )
 
     deadline = time.time() + wait_seconds
     while time.time() < deadline:
         if is_port_open(timeout=0.2):
             return
+        # If the subprocess has already exited, surface its log tail instead of
+        # waiting out the full deadline and silently misconfiguring the app.
+        if process.poll() is not None:
+            break
         time.sleep(0.2)
+
+    if not is_port_open():
+        tail = ""
+        try:
+            tail = log_path.read_text(encoding="utf-8", errors="replace")[-1000:]
+        except OSError:
+            pass
+        exit_info = (
+            f" (process exited with code {process.returncode})"
+            if process.poll() is not None
+            else ""
+        )
+        raise RuntimeError(
+            f"LoRA server failed to start within {wait_seconds}s on "
+            f"{LORA_HOST}:{LORA_PORT}{exit_info}. See {log_path}."
+            + (f"\nLast logs:\n{tail}" if tail else "")
+        )

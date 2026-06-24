@@ -1,4 +1,14 @@
-"""Main script for running the book generation system."""
+"""LEGACY CLI entry point for the older AutoGen book generation pipeline.
+
+This script (and book_generator.py / outline_generator.py / agents.py) is the older
+AutoGen pipeline, reachable ONLY by running this file directly. It is NOT used by the
+live applications. The maintained, user-facing apps are:
+  - app_gradio.py  (the Gradio Studio UI)
+  - web_app.py     (the Flask web app)
+
+Prefer those for actual book generation. This module is kept correct and importable
+for reference and CLI use only.
+"""
 import os
 
 from config import get_config

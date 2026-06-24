@@ -1,12 +1,22 @@
 """Gradio UI for the full-text rewrite agent."""
 from __future__ import annotations
 
+import logging
 import queue
 import socket
 import threading
 from pathlib import Path
+from typing import Callable, Iterator
 
 import gradio as gr
+
+logger = logging.getLogger(__name__)
+
+# How long (seconds) the UI waits for a single progress message before deciding the
+# worker has hung. Generous because a single long manuscript window can take minutes.
+_QUEUE_TIMEOUT_SECONDS = 1800
+# Defensive upper bound on joining the finished worker thread.
+_JOIN_TIMEOUT_SECONDS = 30
 
 from rewrite_agent import (
     DEFAULT_API_KEY,
@@ -55,11 +65,70 @@ def get_gradio_port(host: str, default_port: int = 7870) -> int:
 def _file_path(file_obj) -> str | None:
     if file_obj is None:
         return None
-    return str(getattr(file_obj, "name", file_obj))
+    path = str(getattr(file_obj, "name", file_obj)).strip()
+    if not path:
+        return None
+    if not Path(path).is_file():
+        raise FileNotFoundError(f"找不到檔案或無法讀取：{path}")
+    return path
+
+
+def _safe_error(exc: BaseException) -> str:
+    """User-facing one-liner for an exception; full detail is logged server-side."""
+    logger.exception("Worker failed", exc_info=exc)
+    detail = str(exc).strip().splitlines()
+    brief = detail[0] if detail else exc.__class__.__name__
+    # Keep it short so we never leak stack traces / API payloads into the UI.
+    return brief[:200]
 
 
 # Sentinel pushed onto the progress queue when the worker thread finishes.
 _DONE = object()
+
+
+def _stream_worker(work: Callable[[Callable[[str], None]], object], state: dict) -> Iterator[list[str]]:
+    """Run `work` in a daemon thread, yielding accumulated status lines as they arrive.
+
+    `work` receives a `report(msg)` callback and returns its result; on success the
+    result is stored in state["result"], on failure the exception in state["error"].
+    Yields the growing list of status lines. Uses bounded waits so the UI cannot
+    freeze forever if the worker hangs or dies without signalling completion.
+    """
+    progress_queue: queue.Queue = queue.Queue()
+
+    def report(message: str) -> None:
+        progress_queue.put(message)
+
+    def worker() -> None:
+        try:
+            state["result"] = work(report)
+        except Exception as exc:  # noqa: BLE001
+            state["error"] = exc
+        finally:
+            progress_queue.put(_DONE)
+
+    # daemon=True: if the interpreter is shutting down we don't want a lingering
+    # network call to block process exit. The bounded waits below handle the UX.
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+
+    status_lines: list[str] = []
+    while True:
+        try:
+            message = progress_queue.get(timeout=_QUEUE_TIMEOUT_SECONDS)
+        except queue.Empty:
+            if not worker_thread.is_alive():
+                # Worker died without enqueuing _DONE; surface whatever we have.
+                break
+            logger.error("Worker produced no progress for %ss; aborting wait.", _QUEUE_TIMEOUT_SECONDS)
+            state.setdefault("error", TimeoutError("作業逾時，未在預期時間內回應。"))
+            break
+        if message is _DONE:
+            break
+        status_lines.append(str(message))
+        yield status_lines
+    worker_thread.join(timeout=_JOIN_TIMEOUT_SECONDS)
+    state["status_lines"] = status_lines
 
 
 def run_rewrite(
@@ -87,7 +156,11 @@ def run_rewrite(
     api_model,
 ):
     source_text = ""
-    target_path = _file_path(target_file)
+    try:
+        target_path = _file_path(target_file)
+    except FileNotFoundError as exc:
+        yield _safe_error(exc), "", None
+        return
     if target_path:
         source_text = read_text_file(target_path)
     elif target_text and target_text.strip():
@@ -106,12 +179,20 @@ def run_rewrite(
         if latest is None:
             yield "找不到診斷書。請先在上方「① 全篇分析診斷（Grok）」按開始分析，再勾選套用。", "", None
             return
-        diagnosis = load_diagnosis(latest)
+        try:
+            diagnosis = load_diagnosis(latest)
+        except Exception as exc:  # noqa: BLE001
+            yield _safe_error(exc), "", None
+            return
         diag_spine_seed = diagnosis.spine_seed
         diag_brief = diagnosis.rewrite_brief()
         diag_window_problems = diagnosis.window_problems
 
-    style_paths = [_file_path(file_obj) for file_obj in (style_files or [])]
+    try:
+        style_paths = [_file_path(file_obj) for file_obj in (style_files or [])]
+    except FileNotFoundError as exc:
+        yield _safe_error(exc), "", None
+        return
     style_paths = [path for path in style_paths if path]
     style_reference = "\n\n".join(part for part in [style_text.strip(), load_reference_text(style_paths)] if part)
 
@@ -142,36 +223,18 @@ def run_rewrite(
     # Run the (blocking) rewrite in a worker thread and stream progress lines to
     # the UI through a queue, so the user sees per-chunk progress live instead of
     # a frozen screen until the whole manuscript is done.
-    progress_queue: queue.Queue = queue.Queue()
-    state: dict = {}
-
-    def report(message: str) -> None:
-        progress_queue.put(message)
-
-    def worker() -> None:
-        try:
-            state["result"] = full_rewrite(source_text=source_text, settings=settings, progress=report)
-        except Exception as exc:  # noqa: BLE001
-            state["error"] = exc
-        finally:
-            progress_queue.put(_DONE)
-
     yield "準備開始。第一次本地 LoRA 可能會先載入模型，畫面會等比較久。", "", None
 
-    worker_thread = threading.Thread(target=worker, daemon=True)
-    worker_thread.start()
-
-    status_lines: list[str] = []
-    while True:
-        message = progress_queue.get()
-        if message is _DONE:
-            break
-        status_lines.append(str(message))
+    state: dict = {}
+    for status_lines in _stream_worker(
+        lambda report: full_rewrite(source_text=source_text, settings=settings, progress=report),
+        state,
+    ):
         yield "\n".join(status_lines), "", None
-    worker_thread.join()
 
+    status_lines = state.get("status_lines", [])
     if state.get("error") is not None:
-        yield "\n".join(status_lines + [f"失敗：{state['error']}"]), "", None
+        yield "\n".join(status_lines + [f"失敗：{_safe_error(state['error'])}"]), "", None
         return
 
     result = state["result"]
@@ -197,7 +260,11 @@ def run_analysis(
     analysis_instruction,
 ):
     source_text = ""
-    target_path = _file_path(target_file)
+    try:
+        target_path = _file_path(target_file)
+    except FileNotFoundError as exc:
+        yield _safe_error(exc), ""
+        return
     if target_path:
         source_text = read_text_file(target_path)
     elif target_text and target_text.strip():
@@ -210,44 +277,37 @@ def run_analysis(
         yield "缺少 Grok（XAI）API 金鑰。請設定環境變數 XAI_API_KEY，或填入上方欄位。", ""
         return
 
+    # Validate window_chars against the same bounds the UI slider enforces, so a
+    # direct/out-of-range call gets a clear message instead of silent clamping.
+    try:
+        window_chars_int = int(window_chars)
+    except (TypeError, ValueError):
+        yield "分析視窗字數必須是數字（建議 2000–12000）。", ""
+        return
+    if not (2000 <= window_chars_int <= 12000):
+        yield "分析視窗字數需介於 2000 至 12000 之間。", ""
+        return
+
     settings = AnalysisSettings(
         api_key=analysis_api_key,
         base_url=analysis_base_url,
         model=analysis_model,
-        analysis_chunk_chars=int(window_chars),
+        analysis_chunk_chars=window_chars_int,
         instruction=analysis_instruction or "",
     )
 
-    progress_queue: queue.Queue = queue.Queue()
-    state: dict = {}
-
-    def report(message: str) -> None:
-        progress_queue.put(message)
-
-    def worker() -> None:
-        try:
-            state["result"] = analyze_manuscript(source_text=source_text, settings=settings, progress=report)
-        except Exception as exc:  # noqa: BLE001
-            state["error"] = exc
-        finally:
-            progress_queue.put(_DONE)
-
     yield "Grok 深度分析開始（逐段多專家，長文會花較久）...", ""
 
-    worker_thread = threading.Thread(target=worker, daemon=True)
-    worker_thread.start()
-
-    status_lines: list[str] = []
-    while True:
-        message = progress_queue.get()
-        if message is _DONE:
-            break
-        status_lines.append(str(message))
+    state: dict = {}
+    for status_lines in _stream_worker(
+        lambda report: analyze_manuscript(source_text=source_text, settings=settings, progress=report),
+        state,
+    ):
         yield "\n".join(status_lines), ""
-    worker_thread.join()
 
+    status_lines = state.get("status_lines", [])
     if state.get("error") is not None:
-        yield "\n".join(status_lines + [f"分析失敗：{state['error']}"]), ""
+        yield "\n".join(status_lines + [f"分析失敗：{_safe_error(state['error'])}"]), ""
         return
 
     diagnosis, md_path, _json_path = state["result"]

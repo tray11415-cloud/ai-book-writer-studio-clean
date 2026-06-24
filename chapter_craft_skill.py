@@ -1,6 +1,8 @@
 """Chapter-level fiction craft analysis skill for the Gradio studio."""
 from __future__ import annotations
 
+import logging
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,6 +15,43 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read a positive int from the environment, falling back to ``default``."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+# Env-configurable defaults (sane fallbacks keep existing behaviour).
+API_TIMEOUT = _env_int("AI_BOOK_API_TIMEOUT", 900)
+SPECIALIST_MAX_WORKERS = _env_int("AI_BOOK_MAX_WORKERS", 4)
+
+
+def language_instruction(output_language: str) -> str:
+    """Map a UI language choice to a model instruction.
+
+    Shared helper imported by the other skill modules to avoid duplication.
+    """
+    mapping = {
+        "繁体中文": "請使用繁體中文。",
+        "繁體中文": "請使用繁體中文。",
+        "简体中文": "请使用简体中文。",
+        "English": "Use English.",
+        "日本語": "日本語で出力してください。",
+    }
+    return mapping.get(output_language or "", "請使用繁體中文。")
 
 
 DEFAULT_GOAL = (
@@ -108,7 +147,7 @@ def analyze_chapter_craft(
             client = OpenAI(
                 api_key=(api_key or "not-needed").strip(),
                 base_url=base_url.strip().rstrip("/"),
-                timeout=900,
+                timeout=API_TIMEOUT,
             )
 
         reports: list[ChapterReport] = []
@@ -170,7 +209,8 @@ def read_text_file(path: str | Path, encoding: str = "utf-8") -> str:
         tried.add(candidate)
         try:
             return file_path.read_text(encoding=candidate)
-        except UnicodeDecodeError:
+        except UnicodeDecodeError as exc:
+            logger.debug("Encoding %s failed for %s: %s", candidate, file_path, exc)
             continue
     return file_path.read_text(encoding=encoding)
 
@@ -267,6 +307,16 @@ def split_long_block(block: str, chunk_chars: int) -> list[str]:
 def load_chapters_from_directory_url(url: str, limit: int | None) -> list[Chapter]:
     session = requests.Session()
     session.headers.update({"User-Agent": "AI-Book-Writer-ChapterCraft/0.1"})
+    # Retry transient failures with exponential backoff for resilience.
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
     html = fetch_text(session, url)
     links = extract_chapter_links(html, url)
     if limit:
@@ -275,13 +325,23 @@ def load_chapters_from_directory_url(url: str, limit: int | None) -> list[Chapte
         raise ValueError("找不到章節連結；請確認網址是靜態 HTML 目錄頁，或改用 TXT。")
 
     chapters: list[Chapter] = []
+    failed: list[str] = []
     for index, (title, chapter_url) in enumerate(links, start=1):
-        chapter_html = fetch_text(session, chapter_url)
-        text = extract_main_text(chapter_html)
+        try:
+            chapter_html = fetch_text(session, chapter_url)
+            text = extract_main_text(chapter_html)
+        except Exception as exc:  # network/parse failure for one chapter
+            logger.warning("Failed to fetch chapter %s (%s): %s", title, chapter_url, exc)
+            failed.append(title)
+            text = ""
         if text:
             chapters.append(Chapter(index=index, title=title, text=text, source_url=chapter_url))
         if index < len(links):
             time.sleep(0.8)
+    if not chapters:
+        raise ValueError("所有章節都讀取失敗；請確認網址或網站是否可連線。")
+    if failed:
+        logger.warning("%d 章讀取失敗：%s", len(failed), "、".join(failed))
     return chapters
 
 
@@ -371,7 +431,8 @@ def run_specialists(
     goal: str,
 ) -> list[SpecialistResult]:
     results: list[SpecialistResult] = []
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    failed: list[str] = []
+    with ThreadPoolExecutor(max_workers=SPECIALIST_MAX_WORKERS) as executor:
         futures = {
             executor.submit(
                 ask_specialist,
@@ -387,8 +448,24 @@ def run_specialists(
             for role, spec in SPECIALISTS.items()
         }
         for future in as_completed(futures):
-            results.append(future.result())
+            role = futures[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                # Record the failure but keep the remaining specialists alive.
+                logger.error("Specialist %s failed: %s", role, exc)
+                spec = SPECIALISTS[role]
+                failed.append(spec["title"])
+                results.append(
+                    SpecialistResult(
+                        role=role,
+                        title=spec["title"],
+                        analysis=f"[ERROR] 此分析員執行失敗：{exc}",
+                    )
+                )
 
+    if failed:
+        logger.warning("以下分析員失敗：%s", "、".join(failed))
     role_order = list(SPECIALISTS)
     return sorted(results, key=lambda item: role_order.index(item.role))
 
@@ -428,13 +505,15 @@ def ask_specialist(
             ),
         },
     ]
-    response = client.chat.completions.create(
+    analysis = chat_complete(
+        client,
+        label=f"專家「{title}」",
         model=model_name,
         messages=messages,
         temperature=0.25,
         max_tokens=1800,
     )
-    return SpecialistResult(role=role, title=title, analysis=read_message(response))
+    return SpecialistResult(role=role, title=title, analysis=analysis)
 
 
 def synthesize_report(
@@ -447,7 +526,9 @@ def synthesize_report(
     cluster_notes = "\n\n".join(
         f"## {result.title}\n{result.analysis}" for result in specialist_results
     )
-    response = client.chat.completions.create(
+    return chat_complete(
+        client,
+        label="總編整合",
         model=model_name,
         messages=[
             {
@@ -480,11 +561,34 @@ def synthesize_report(
         temperature=0.2,
         max_tokens=3200,
     )
+
+
+def chat_complete(client: OpenAI, *, label: str = "LLM", **kwargs: Any) -> str:
+    """Call chat.completions.create and return the message text.
+
+    Wraps the network call and response parsing in a single place so callers
+    get a clear, contextual error instead of a raw SDK / IndexError.
+    """
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        logger.error("%s 呼叫失敗：%s", label, exc)
+        raise RuntimeError(f"{label} 呼叫失敗：{exc}") from exc
     return read_message(response)
 
 
 def read_message(response: Any) -> str:
-    return (response.choices[0].message.content or "").strip()
+    try:
+        choices = response.choices
+    except AttributeError as exc:
+        raise RuntimeError(f"LLM 回應缺少 choices 欄位：{response!r}") from exc
+    if not choices:
+        raise RuntimeError(f"LLM 回應沒有任何 choices：{response!r}")
+    try:
+        content = choices[0].message.content
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"無法讀取 LLM 回應內容：{exc}") from exc
+    return (content or "").strip()
 
 
 def write_reports(reports: list[ChapterReport], source_label: str) -> Path:
@@ -501,14 +605,25 @@ def write_reports(reports: list[ChapterReport], source_label: str) -> Path:
     combined = [index_lines[0], "", index_lines[2], ""]
     for report in reports:
         file_name = f"{report.chapter.index:03d}-{slugify(report.chapter.title)}.md"
-        (output_dir / file_name).write_text(render_chapter_report(report), encoding="utf-8")
+        write_text_with_backup(output_dir / file_name, render_chapter_report(report))
         index_lines.append(f"- [第 {report.chapter.index} 章｜{report.chapter.title}]({file_name})")
         combined.append(render_chapter_report(report))
         combined.append("\n---\n")
 
-    (output_dir / "index.md").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
-    (output_dir / "full_report.md").write_text("\n".join(combined).strip() + "\n", encoding="utf-8")
+    write_text_with_backup(output_dir / "index.md", "\n".join(index_lines) + "\n")
+    write_text_with_backup(output_dir / "full_report.md", "\n".join(combined).strip() + "\n")
     return output_dir
+
+
+def write_text_with_backup(path: Path, content: str) -> None:
+    """Write ``content`` to ``path``, backing up any existing file first."""
+    if path.exists():
+        backup = path.with_name(f"{path.name}.{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.bak")
+        try:
+            path.replace(backup)
+        except OSError as exc:
+            logger.warning("無法備份既有檔案 %s：%s", path, exc)
+    path.write_text(content, encoding="utf-8")
 
 
 def render_chapter_report(report: ChapterReport) -> str:

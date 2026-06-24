@@ -1,4 +1,9 @@
-"""Generate book outlines using AutoGen agents with improved error handling"""
+"""Generate book outlines using the legacy AutoGen multi-agent pipeline.
+
+LEGACY / CLI ONLY: Part of the older AutoGen pipeline reachable only via ``main.py``.
+The maintained, user-facing apps are ``app_gradio.py`` and ``web_app.py``; they do not
+use this module. Kept correct and importable for the CLI path only.
+"""
 import autogen
 from typing import Dict, List
 import re
@@ -48,20 +53,32 @@ There should be clear content for each chapter. There should be a total of {num_
 
 End the outline with 'END OF OUTLINE'"""
 
-        try:
-            # Initiate the chat
-            self.agents["user_proxy"].initiate_chat(
-                manager,
-                message=outline_prompt
-            )
+        # Run the chat. A failure to even talk to the model is fatal here.
+        self.agents["user_proxy"].initiate_chat(
+            manager,
+            message=outline_prompt
+        )
 
-            # Extract the outline from the chat messages
-            return self._process_outline_results(groupchat.messages, num_chapters)
-            
-        except Exception as e:
-            print(f"Error generating outline: {str(e)}")
-            # Try to salvage any outline content we can find
-            return self._emergency_outline_processing(groupchat.messages, num_chapters)
+        # Parse the resulting messages. Retry parsing a couple of times before
+        # giving up: parsing is cheap and the message list is already in hand, so
+        # we do NOT re-run the (expensive) chat. We deliberately do NOT fall back to
+        # placeholder chapters on a parse failure -- that would silently hand the
+        # book generator useless "[To be determined]" prompts.
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                return self._process_outline_results(groupchat.messages, num_chapters)
+            except ValueError as e:
+                last_error = e
+                print(f"Outline parse attempt {attempt} failed: {e}")
+
+        # Parsing kept producing too few chapters: fail loudly rather than
+        # returning a partial/placeholder outline.
+        raise ValueError(
+            f"Failed to generate a complete {num_chapters}-chapter outline after "
+            f"3 parse attempts ({last_error}). Please retry or provide more detailed "
+            f"requirements."
+        )
 
     def _get_sender(self, msg: Dict) -> str:
         """Helper to get sender from message regardless of format"""
@@ -107,12 +124,24 @@ End the outline with 'END OF OUTLINE'"""
         
         for i, section in enumerate(chapter_sections[1:], 1):  # Skip first empty section
             try:
-                    # Extract required components
-                title_match = re.search(r'\*?\*?Title:\*?\*?\s*(.+?)(?=\n|$)', section, re.IGNORECASE)
-                events_match = re.search(r'\*?\*?Key Events:\*?\*?\s*(.*?)(?=\*?\*?Character Developments:|$)', section, re.DOTALL | re.IGNORECASE)
-                character_match = re.search(r'\*?\*?Character Developments:\*?\*?\s*(.*?)(?=\*?\*?Setting:|$)', section, re.DOTALL | re.IGNORECASE)
-                setting_match = re.search(r'\*?\*?Setting:\*?\*?\s*(.*?)(?=\*?\*?Tone:|$)', section, re.DOTALL | re.IGNORECASE)
-                tone_match = re.search(r'\*?\*?Tone:\*?\*?\s*(.*?)(?=\*?\*?Chapter \d+:|$)', section, re.DOTALL | re.IGNORECASE)
+                    # Extract required components in an order-independent way: each
+                    # field reads until the next *any* known field header, so the
+                    # outline_creator can emit fields in any order without breaking.
+                _field_names = ['Title', 'Key Events', 'Character Developments', 'Setting', 'Tone']
+                _boundary = '|'.join(re.escape(n) for n in _field_names)
+
+                def _extract(field_name: str):
+                    pattern = (
+                        r'\*?\*?' + re.escape(field_name) + r':\*?\*?\s*'
+                        r'(.*?)(?=\n\s*\*?\*?(?:' + _boundary + r')\b|\*?\*?Chapter \d+:|$)'
+                    )
+                    return re.search(pattern, section, re.DOTALL | re.IGNORECASE)
+
+                title_match = _extract('Title')
+                events_match = _extract('Key Events')
+                character_match = _extract('Character Developments')
+                setting_match = _extract('Setting')
+                tone_match = _extract('Tone')
 
                 # If no explicit title match, try to get it from the chapter header
                 if not title_match:
@@ -161,26 +190,28 @@ End the outline with 'END OF OUTLINE'"""
         return chapters
 
     def _verify_chapter_sequence(self, chapters: List[Dict], num_chapters: int) -> List[Dict]:
-        """Verify and fix chapter numbering"""
+        """Verify and fix chapter numbering, requiring the full chapter count.
+
+        Renumbers extracted chapters sequentially. If fewer than ``num_chapters``
+        real chapters were found we fail loudly instead of padding with
+        ``[To be determined]`` placeholders, which would silently degrade the book.
+        """
         # Sort chapters by their current number
         chapters.sort(key=lambda x: x['chapter_number'])
-        
+
         # Renumber chapters sequentially starting from 1
         for i, chapter in enumerate(chapters, 1):
             chapter['chapter_number'] = i
-        
-        # Add placeholder chapters if needed
-        while len(chapters) < num_chapters:
-            next_num = len(chapters) + 1
-            chapters.append({
-                'chapter_number': next_num,
-                'title': f'Chapter {next_num}',
-                'prompt': '- Key events: [To be determined]\n- Character developments: [To be determined]\n- Setting: [To be determined]\n- Tone: [To be determined]'
-            })
-        
+
+        if len(chapters) < num_chapters:
+            raise ValueError(
+                f"Unable to recover {num_chapters} valid chapters; only found "
+                f"{len(chapters)}. Please retry or provide more detailed requirements."
+            )
+
         # Trim excess chapters if needed
         chapters = chapters[:num_chapters]
-        
+
         return chapters
 
     def _emergency_outline_processing(self, messages: List[Dict], num_chapters: int) -> List[Dict]:
@@ -219,16 +250,12 @@ End the outline with 'END OF OUTLINE'"""
                 current_chapter = None
         
         if not chapters:
-            print("Emergency processing failed to find any chapters")
-            # Create a basic outline structure
-            chapters = [
-                {
-                    'chapter_number': i,
-                    'title': f'Chapter {i}',
-                    'prompt': '- Key events: [To be determined]\n- Character developments: [To be determined]\n- Setting: [To be determined]\n- Tone: [To be determined]'
-                }
-                for i in range(1, num_chapters + 1)
-            ]
-        
-        # Ensure proper sequence and number of chapters
+            # No chapters at all: fail loudly rather than fabricating a fully
+            # placeholder outline that the book generator cannot work with.
+            raise ValueError(
+                "Emergency outline processing found no chapters in the chat output. "
+                "Please retry outline generation."
+            )
+
+        # Ensure proper sequence and number of chapters (raises if too few real ones).
         return self._verify_chapter_sequence(chapters, num_chapters)

@@ -1,4 +1,10 @@
-"""Define the agents used in the book generation system with improved context management"""
+"""Define the agents used in the legacy AutoGen book generation pipeline.
+
+LEGACY / CLI ONLY: These agents are used only by the older AutoGen pipeline reachable
+via ``main.py``. The maintained, user-facing apps are ``app_gradio.py`` and
+``web_app.py``, which do not use these agents. Kept correct and importable for the
+CLI path only.
+"""
 import autogen
 from typing import Dict, List, Optional
 
