@@ -696,15 +696,26 @@ def generate_continuation_prompt(
             + ("\n\n---\n# 鎖定敘事方式（System Prompt）\n\n" + system_prompt if has_skill else "")
         )
         status = (
-            "[OK] 已產生續寫 PROMPT 並載入寫作區："
-            f"{'敘事方式＋技法庫＋' if has_skill else ''}續寫指令＋避免重複詞（{len(overused)} 條）。\n"
-            f"規劃接下來 {n} 個節拍。{'（Dry Run 範例）' if dry_run else ''}\n"
-            "→ 切到『3. 寫作』直接續寫；寫作時仍會自動走重複守衛。"
+            "[OK] 已產生續寫 PROMPT。"
+            f"已載入寫作區：{'敘事方式＋技法庫＋' if has_skill else ''}避免重複詞（{len(overused)} 條）。\n"
+            f"規劃了 {n} 個節拍。{'（Dry Run 範例）' if dry_run else ''}\n"
+            "→ 續寫 PROMPT 顯示在下方**可編輯**框，可手動修改每一拍；改完按『③b 套用編輯後的內容到寫作區』。"
         )
         return status, trim_preview(preview), system_prompt, technique_library, instruction, avoid_words
     except Exception as exc:  # noqa: BLE001
         logger.exception("generate_continuation_prompt failed")
         return f"[ERROR] {exc}", "", "", "", "", ""
+
+
+def apply_edited_continuation_prompt(edited_prompt: str) -> tuple[str, str]:
+    """Push the user-edited continuation prompt (beats) into the writing Story Instruction.
+
+    Returns (instruction, status).
+    """
+    text = (edited_prompt or "").strip()
+    if not text:
+        return "", "[ERROR] 編輯框是空的；請先在 Step 3 產出續寫 PROMPT，或貼上內容。"
+    return text, "[OK] 已把編輯後的續寫 PROMPT 套用到『3. 寫作』的 Story Instruction。請切過去續寫。"
 
 
 def _orchestrate_continuation(

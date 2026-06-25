@@ -42,6 +42,7 @@ from story_skill_studio import distill_story_skill, orchestrate_story_prompt
 from story_skill_studio import load_latest_skill_to_agent_fields, load_orchestration_to_agent_fields
 from story_skill_studio import load_skill_techniques_to_agent_fields
 from story_skill_studio import read_continuation_source, generate_continuation_prompt
+from story_skill_studio import apply_edited_continuation_prompt
 from project_saves import delete_project_slot, load_project_slot, refresh_slots, save_project_slot
 from skill_technique_review import REVIEW_CHOICES, review_skill_and_technique
 from technique_library_builder import ALL_CATEGORY_CHOICES, BOOK_LIBRARY_LOAD_MODES
@@ -2039,9 +2040,19 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
             with gr.Row():
                 cont_next_chapters = gr.Number(label="規劃接下來幾拍/章", value=5, precision=0)
                 cont_prompt_dry_run = gr.Checkbox(label="Dry Run / 離線檢查", value=True)
-            cont_prompt_btn = gr.Button("③ 產出續寫 PROMPT 並載入寫作區", variant="primary")
+            cont_prompt_btn = gr.Button("③ 產出續寫 PROMPT", variant="primary")
             cont_prompt_status = gr.Textbox(label="Prompt Status", lines=4, interactive=False)
-            cont_prompt_preview = gr.Markdown(label="Continuation Prompt Preview")
+            cont_prompt_editor = gr.Textbox(
+                label="續寫 PROMPT（可手動編輯每一拍，改完按 ③b 套用）",
+                lines=22,
+                interactive=True,
+                show_copy_button=True,
+            )
+            with gr.Row():
+                cont_prompt_apply_btn = gr.Button("③b 套用編輯後的內容到寫作區", variant="primary")
+            cont_prompt_apply_status = gr.Textbox(label="Apply Status", lines=2, interactive=False)
+            with gr.Accordion("格式化預覽 Rendered Preview（唯讀）", open=False):
+                cont_prompt_preview = gr.Markdown()
 
     with gr.Tab("13. 說明書 Manual"):
         gr.Markdown(
@@ -2559,9 +2570,16 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
             cont_prompt_preview,
             system_prompt_input,
             technique_library_input,
-            instruction,
+            cont_prompt_editor,
             avoid_words_input,
         ],
+        api_name=False,
+    )
+
+    cont_prompt_apply_btn.click(
+        apply_edited_continuation_prompt,
+        inputs=[cont_prompt_editor],
+        outputs=[instruction, cont_prompt_apply_status],
         api_name=False,
     )
 
