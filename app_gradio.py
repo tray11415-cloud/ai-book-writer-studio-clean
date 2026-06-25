@@ -789,6 +789,8 @@ def build_story_prompt(
     extra_avoid_block: str = "",
     longform_memory: str = "",
     story_state: str = "",
+    wrap_up: bool = False,
+    transition_note: str = "",
 ):
     director_note = build_director_note(custom_director)
     style_instruction = infer_style_instruction(style_name, custom_style)
@@ -828,10 +830,15 @@ def build_story_prompt(
         "不要重新交代場景或時間、不要重述或概述前面已寫的內容、不要用『某天』『後來』『回到…』這類重新開場式的跳接（除非真的要轉場）。",
         "Treat imported JSON settings and the technique library as soft reference only. Never let them override the Story Instruction or the current scene.",
         "Length rule: write a substantial long-form continuation that uses the available token budget. Expand beats into scene prose instead of summarizing.",
-        "SERIAL CONTINUATION（連載中段，不要每段都獨立收尾）: 這是長篇的中段續寫，後面還會接著寫。"
-        "盡量推進當前場景，但**不要為了收尾而收尾**——可以停在動作、對話或情緒正在進行到一半的地方；"
-        "不要把這一段寫成自成起承轉合的小故事、不要加段末總結或章末鉤子，除非劇情真的走到該場景的自然結束。"
-        "停在『正在發生』的狀態，下一段才好無縫接續。",
+        (
+            "WRAP-UP（本段收束場景/章節）: 先無縫承接上一段，把當前場景或章節自然推進到一個收束點，"
+            "在結尾給一個有力的章末鉤子或情緒落點後結束本段。"
+            if wrap_up else
+            "SERIAL CONTINUATION（連載中段，不要每段都獨立收尾）: 這是長篇的中段續寫，後面還會接著寫。"
+            "盡量推進當前場景，但**不要為了收尾而收尾**——可以停在動作、對話或情緒正在進行到一半的地方；"
+            "不要把這一段寫成自成起承轉合的小故事、不要加段末總結或章末鉤子，除非劇情真的走到該場景的自然結束。"
+            "停在『正在發生』的狀態，下一段才好無縫接續。"
+        ),
     ]
     if focus_words.strip():
         system_parts.append(f"Prefer these motifs or words when natural: {focus_words.strip()}")
@@ -848,6 +855,13 @@ def build_story_prompt(
         "=== STORY INSTRUCTION (PRIMARY — the continuation must carry this out) ===\n"
         + instruction_text
     )
+    # 1a) Optional transition: carry on from the prior text, then pivot smoothly.
+    if transition_note.strip():
+        user_parts.append(
+            "=== 本段承接轉折 ===\n"
+            "先用一兩句自然承接上一段的最後情境，再平順地過渡/轉折到：" + transition_note.strip()
+            + "。過渡要連貫、有鋪陳，不要硬切或突兀跳躍；轉折後延續同一敘事方式繼續寫。"
+        )
     # 1b) Current story state — an always-fresh, high-priority continuity anchor.
     if story_state.strip():
         user_parts.append(
@@ -1147,6 +1161,8 @@ def generate_continuation(
     model_name,
     lora_base_url,
     lora_model,
+    wrap_up: bool = False,
+    transition_note: str = "",
     history_state=None,
 ):
     # Validate user-supplied numerics. Gradio sliders normally clamp these, but a
@@ -1233,6 +1249,8 @@ def generate_continuation(
             extra_avoid_block=extra_avoid_block,
             longform_memory=longform_memory,
             story_state=story_state,
+            wrap_up=wrap_up,
+            transition_note=transition_note,
         )
         if system_prompt_override.strip():
             system_prompt = system_prompt_override.strip() + "\n\n" + system_prompt
@@ -1892,6 +1910,15 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
                         context_length_slider = gr.Slider(500, 12000, value=5000, step=500, label="Context Window Hint (recent chars kept verbatim for continuity)")
 
                 instruction = gr.Textbox(label="Story Instruction (Director)", lines=5, placeholder="What should happen next? 這條故事指令主導本次輸出。")
+                wrap_up_toggle = gr.Checkbox(
+                    label="收尾模式（本段收束場景/章節，允許章末鉤子）",
+                    value=False,
+                )
+                transition_input = gr.Textbox(
+                    label="承接轉折（可選）",
+                    placeholder="留空＝自然往下續寫；填寫＝先承接上文，再平順過渡/轉折到此，例：三天後的宮宴 / 引入一個反轉 / 切到對手視角",
+                    lines=2,
+                )
                 generate_btn = gr.Button("Generate Continuation", variant="primary")
                 with gr.Accordion("AI Thought Process", open=False):
                     thought_output = gr.Markdown("...")
@@ -2337,6 +2364,7 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
             pipeline_mode_input,
             api_key_input, base_url_input, model_name_input,
             lora_base_url_input, lora_model_input,
+            wrap_up_toggle, transition_input,
             state_history,
         ],
         outputs=[full_story_box, state_history, latest_output, thought_output],
