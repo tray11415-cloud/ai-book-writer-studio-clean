@@ -823,9 +823,15 @@ def build_story_prompt(
         "沿用上一段的場景、在場人物、時間、地點、語氣與尚未完成的動作/情緒，從『接續錨點』的最後一句無縫往下寫；"
         "保持人物性格、稱謂、已知事實與時間線一致；不要跳場、不要重啟故事、不要回頭重述或改寫已發生的內容。"
         "若 Story Instruction 與當前場景銜接有落差，先用一兩句自然過渡，不要硬切。",
+        "SAME-NARRATOR SPLICE（像同一個人接著往下寫）: 把這次輸出當成上一段的『直接延續』——"
+        "同一個敘述者、同樣的人稱與語氣，第一句就咬住上一段最後一句的情境與動作往下接；"
+        "不要重新交代場景或時間、不要重述或概述前面已寫的內容、不要用『某天』『後來』『回到…』這類重新開場式的跳接（除非真的要轉場）。",
         "Treat imported JSON settings and the technique library as soft reference only. Never let them override the Story Instruction or the current scene.",
         "Length rule: write a substantial long-form continuation that uses the available token budget. Expand beats into scene prose instead of summarizing.",
-        "Do not stop after the first beat; continue until the scene reaches a natural turn, reveal, or ending hook.",
+        "SERIAL CONTINUATION（連載中段，不要每段都獨立收尾）: 這是長篇的中段續寫，後面還會接著寫。"
+        "盡量推進當前場景，但**不要為了收尾而收尾**——可以停在動作、對話或情緒正在進行到一半的地方；"
+        "不要把這一段寫成自成起承轉合的小故事、不要加段末總結或章末鉤子，除非劇情真的走到該場景的自然結束。"
+        "停在『正在發生』的狀態，下一段才好無縫接續。",
     ]
     if focus_words.strip():
         system_parts.append(f"Prefer these motifs or words when natural: {focus_words.strip()}")
