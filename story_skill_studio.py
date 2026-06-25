@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,7 @@ from openai import OpenAI
 import repetition_guard as rg
 from chapter_craft_skill import (
     API_TIMEOUT,
+    SPECIALIST_MAX_WORKERS,
     Chapter,
     chat_complete,
     language_instruction,
@@ -58,11 +60,9 @@ DEFAULT_SKILL_DISTILL_GOAL = (
 # WRITING model as the Story Instruction, so it competes with the story context;
 # keep it well under the writing model's context window.
 CONTINUATION_PLAN_MAX_TOKENS = int(os.getenv("BOOK_WRITER_CONTINUATION_PLAN_MAX_TOKENS", "16000"))
-# Detailed beats per LLM call. Many detailed beats can't fit one completion (the
-# model truncates after the first), so large plans are produced in batches and
-# stitched together. Lower this if beats still come back truncated.
-CONTINUATION_BEATS_PER_CALL = max(1, int(os.getenv("BOOK_WRITER_CONTINUATION_BEATS_PER_CALL", "6")))
-# Upper bound on planned beats (each batch is one LLM call), to avoid runaway cost.
+# Each beat is expanded in its OWN LLM call (so the model can never merge beats into
+# ranges or truncate after the first), run in parallel. This caps how many beats a
+# single plan may request, to bound cost / number of calls.
 CONTINUATION_MAX_BEATS = max(1, int(os.getenv("BOOK_WRITER_CONTINUATION_MAX_BEATS", "60")))
 
 DEFAULT_ORCHESTRATION_GOAL = (
@@ -722,75 +722,126 @@ def _orchestrate_continuation(
         raise RuntimeError("缺少 Analysis LLM client。")
     skill_compact = json.dumps(_skill_for_prompt(skill), ensure_ascii=False) if skill else "（未提供技能）"
     avoid_block = "、".join(overused[:20]) if overused else "（無）"
+    lang = language_instruction(output_language)
 
-    system_content = (
-        "你是小說『續寫劇情編排總監 + 提示詞工程師』。你要為一個既有故事規劃『接下來』的劇情，"
-        "並產出一份**詳細到可直接照寫的續寫導演手冊**（不是大綱、不是一行式表格）。鐵則：\n"
-        "1) 這是『續寫』——必須延續既有人物、世界、語氣與未解線索，不可重啟故事、不可另開平行劇情、"
-        "不可重述或改寫已發生的內容。\n"
-        "2) 充分展開：每一個指定的節拍都要寫成數行的具體指示，足夠讓寫作 AI 直接寫出整段場景；"
-        "嚴禁只給『功能｜一句事件｜情緒』這種骨架，**更嚴禁只寫第一拍就停**——指定範圍內的每一拍都必須完整寫出。\n"
-        "3) 若提供了寫作技能，鎖定其敘事方式；每一拍要**逐一指明要套用哪些描寫技法、以及在這個情境裡具體怎麼用**，"
-        "並給一句示範句（demo），不要只列技法名稱。\n"
-        "4) 主動避免重複既有措辞（下方會給出已被用滥的詞句清單），並在每拍提示『這裡換什麼新寫法』。"
-        f"{language_instruction(output_language)}"
+    # Pass 1 — one call: overall direction + a one-line skeleton for ALL beats, so the
+    # parallel per-beat expansions stay coherent and escalate as a sequence.
+    skeleton_raw = chat_complete(
+        route.client,
+        label="續寫骨架",
+        model=route.model_name,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "你是小說『續寫劇情編排總監』。先規劃一個既有故事『接下來』的整體走向，與每一拍的一句話骨架，"
+                    "確保各拍連貫、張力逐步升級、延續既有人物與未解線索，不可重啟故事、不可重述已寫內容。"
+                    f"{lang}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"續寫共要 {n} 拍。\n"
+                    f"【續寫方向（可選）】\n{(direction or '未指定，請依未解線索與情境自然推進').strip()}\n\n"
+                    f"【故事續寫資訊（摘要）】\n{brief_text or '（無摘要，請依最近正文判讀）'}\n\n"
+                    f"【最近正文（接續點）】\n{story[-4000:]}\n\n"
+                    f"【寫作技能 JSON（敘事方式＋技法＋節拍模板）】\n{skill_compact}\n\n"
+                    "請只輸出：\n"
+                    "## 續寫總方向\n（2-4 句，承接目前情境、整體要往哪走、收束哪些張力）\n\n"
+                    "## 拍子骨架（每一拍一行，務必剛好 "
+                    f"{n} 行，格式『第N拍：[節拍功能] 一句話事件』，不可合併、不可寫成範圍）：\n"
+                    "第1拍：...\n第2拍：...\n（依此到第 " + str(n) + " 拍）"
+                ),
+            },
+        ],
+        temperature=0.5,
+        max_tokens=min(CONTINUATION_PLAN_MAX_TOKENS, max(1200, n * 80)),
     )
+    direction_block, beat_oneliners = _split_continuation_skeleton(skeleton_raw, n)
+    full_skeleton = "\n".join(f"第{i}拍：{beat_oneliners.get(i, '（待定）')}" for i in range(1, n + 1))
+
     beat_format = (
-        "每一拍都用下列子標展開成數行，禁止濃縮成一行：\n"
-        "### 第 X 拍：[節拍功能]\n"
-        "- 場景與調度：時間、地點、在場人物、空間與道具的安排\n"
-        "- 事件推進：這一拍具體發生什麼（要有 2-3 個前後因果的動作/轉折，不是一句話）\n"
+        "只輸出『這一拍』的一個區塊，格式如下，每個子標都要具體展開成數行：\n"
+        "### 第 {i} 拍：[節拍功能]\n"
+        "- 場景與調度：時間、地點、在場人物、空間與道具\n"
+        "- 事件推進：具體發生什麼（2-3 個前後因果的動作/轉折，不是一句話）\n"
         "- 人物動機與內心：每個在場角色此刻要什麼、怕什麼、潛台詞\n"
-        "- 對白方向：關鍵對白的語氣、權力關係、要藏什麼、要逼出什麼（給 1-2 句示範台詞）\n"
-        "- 描寫技法套用：逐一點名要用的技法 → 在此處具體怎麼用 + 一句示範句\n"
-        "- 感官與句法節奏：主導感官、句長與停頓的安排\n"
-        "- 銜接與避免重複：如何接上一段結尾；本拍要避免重複的既有寫法、改用什麼新表達\n"
-        "- 本拍推進/收束的線索與章尾鉤子"
+        "- 對白方向：語氣、權力關係、要藏/要逼出什麼（給 1-2 句示範台詞）\n"
+        "- 描寫技法套用：逐一點名技法 → 在此處具體怎麼用 + 一句示範句\n"
+        "- 感官與句法節奏：主導感官、句長與停頓\n"
+        "- 銜接與避免重複：如何接上一段；本拍要避免的既有寫法、改用什麼新表達\n"
+        "- 推進/收束的線索與章尾鉤子"
+    )
+    beat_system = (
+        "你是小說續寫導演。你只負責把『指定的單一節拍』展開成詳細到可直接照寫的導演手冊區塊。鐵則：\n"
+        "1) 只寫被指定的那一拍，輸出剛好一個 `### 第 N 拍：` 區塊；嚴禁寫到別拍、嚴禁合併多拍、嚴禁寫成範圍標題。\n"
+        "2) 續寫：延續既有人物、世界、語氣與未解線索，不重啟、不重述已寫內容。\n"
+        "3) 鎖定技能的敘事方式；逐一點名要套用的描寫技法並給示範句，不只列名稱。\n"
+        "4) 避免重複既有措辞（下方清單），並提示本拍換什麼新寫法。"
+        f"{lang}"
     )
 
-    # Many detailed beats overflow a single completion, so plan in batches and stitch.
-    sections: list[str] = []
-    produced_headers: list[str] = []
-    start = 1
-    while start <= n:
-        end = min(start + CONTINUATION_BEATS_PER_CALL - 1, n)
-        is_first = start == 1
-        tail = story[-4000:] if is_first else story[-2000:]
-        prior = "、".join(f"第{i+1}拍：{h}" for i, h in enumerate(produced_headers)) if produced_headers else "（這是第一批，尚無已規劃的拍）"
-        user_content = (
-            f"整個續寫共要規劃 {n} 拍。本次只規劃【第 {start} 到 {end} 拍】，"
-            f"這 {end - start + 1} 拍**每一拍都必須完整展開**，不可省略、不可只寫第一拍。\n\n"
-            + ("先輸出【## 續寫總方向】（2-4 句，承接目前情境、整體要往哪走），再" if is_first else "直接")
-            + f"輸出第 {start} 到 {end} 拍。\n\n"
-            f"【已規劃過的拍（僅供銜接，不要重寫）】\n{prior}\n\n"
-            f"【續寫方向（使用者意願，可選）】\n{(direction or '未指定，請依未解線索與情境自然推進').strip()}\n\n"
-            f"【故事續寫資訊（摘要）】\n{brief_text or '（無摘要，請依最近正文判讀）'}\n\n"
-            f"【最近正文（接續點，務必無縫銜接）】\n{tail}\n\n"
-            f"【寫作技能 JSON（敘事方式＋技法＋節拍模板）】\n{skill_compact}\n\n"
+    def _expand(i: int) -> tuple[int, str]:
+        user = (
+            f"這是整個續寫 {n} 拍中的『第 {i} 拍』，請只展開這一拍。\n\n"
+            f"【本拍骨架】\n第{i}拍：{beat_oneliners.get(i, '（請依前後脈絡判斷本拍功能）')}\n\n"
+            f"【整體方向】\n{direction_block}\n\n"
+            f"【全拍骨架（前後脈絡，幫助銜接，勿展開別拍）】\n{full_skeleton}\n\n"
+            f"【故事續寫資訊（摘要）】\n{brief_text or '（無摘要）'}\n\n"
+            f"【最近正文（僅第 1 拍需緊接；其餘依骨架銜接）】\n{story[-2500:]}\n\n"
+            f"【寫作技能 JSON】\n{skill_compact}\n\n"
             f"【避免重複的既有措辞】\n{avoid_block}\n\n"
-            f"格式：\n{beat_format}"
+            + beat_format.replace("{i}", str(i))
         )
-        part = chat_complete(
-            route.client,
-            label=f"續寫劇情編排 拍{start}-{end}",
-            model=route.model_name,
-            messages=[
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.6,
-            max_tokens=CONTINUATION_PLAN_MAX_TOKENS,
-        )
-        sections.append(part.strip())
-        produced_headers += re.findall(r"###\s*第\s*\d+\s*拍\s*[：:]\s*([^\n]+)", part)
-        start = end + 1
+        try:
+            text = chat_complete(
+                route.client,
+                label=f"續寫第{i}拍",
+                model=route.model_name,
+                messages=[
+                    {"role": "system", "content": beat_system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.6,
+                max_tokens=CONTINUATION_PLAN_MAX_TOKENS,
+            ).strip()
+        except Exception as exc:  # noqa: BLE001 — one failed beat shouldn't sink the rest
+            logger.error("continuation beat %d failed: %s", i, exc)
+            text = f"### 第 {i} 拍：（產生失敗：{exc}）"
+        if not re.search(r"###\s*第", text):
+            text = f"### 第 {i} 拍\n{text}"
+        return i, text
 
+    results: dict[int, str] = {}
+    with ThreadPoolExecutor(max_workers=SPECIALIST_MAX_WORKERS) as executor:
+        futures = [executor.submit(_expand, i) for i in range(1, n + 1)]
+        for future in as_completed(futures):
+            i, text = future.result()
+            results[i] = text
+
+    beats = "\n\n".join(results[i] for i in range(1, n + 1) if i in results)
     footer = (
-        "\n\n## 整體要推進/收束的未解線索\n（見各拍『推進/收束的線索』。）\n\n"
-        "## 給寫作 AI 的最終 Director 指令\n"
+        "\n\n## 給寫作 AI 的最終 Director 指令\n"
         "延續既有故事與語氣，逐拍照上面手冊寫、逐拍套用指定技法，不重啟、不重述已寫內容，並避免重複既有措辞。"
     )
-    return "\n\n".join(sections).strip() + footer
+    return (direction_block.strip() + "\n\n" + beats).strip() + footer
+
+
+def _split_continuation_skeleton(raw: str, n: int) -> tuple[str, dict[int, str]]:
+    """Split the pass-1 output into the overall direction block and per-beat one-liners."""
+    text = (raw or "").strip()
+    oneliners: dict[int, str] = {}
+    for num, body in re.findall(r"第\s*(\d+)\s*拍\s*[：:]\s*([^\n]+)", text):
+        idx = int(num)
+        if 1 <= idx <= n and idx not in oneliners:
+            oneliners[idx] = body.strip()
+    # Direction block = everything before the first per-beat line (or the 總方向 section).
+    first = re.search(r"第\s*\d+\s*拍\s*[：:]", text)
+    direction_block = text[: first.start()].strip() if first else text
+    if not direction_block:
+        direction_block = "## 續寫總方向\n（承接目前情境，依未解線索自然推進。）"
+    return direction_block, oneliners
 
 
 def _dry_run_continuation_plan(skill: dict[str, Any], brief_text: str, direction: str, n: int) -> str:
