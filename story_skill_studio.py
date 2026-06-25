@@ -728,6 +728,69 @@ def apply_edited_continuation_prompt(edited_prompt: str) -> tuple[str, str]:
     return text, "[OK] 已把編輯後的續寫 PROMPT 套用到『3. 寫作』的 Story Instruction。請切過去續寫。"
 
 
+def revise_continuation_prompt(
+    current_prompt: str,
+    revise_instruction: str,
+    output_language: str,
+    dry_run: bool,
+    analysis_api_key: str,
+    analysis_base_url: str,
+    analysis_model_name: str,
+) -> tuple[str, str]:
+    """AI-edit the continuation director's manual per a free-form instruction
+    (delete a scene/character's screen-time, lengthen/shorten a specific beat, etc.).
+
+    Returns (status, revised_prompt). The revised prompt replaces the editor content.
+    """
+    current = (current_prompt or "").strip()
+    if not current:
+        return "[ERROR] 沒有可修改的續寫 PROMPT；請先按『③ 產出續寫 PROMPT』，或貼上內容。", (current_prompt or "")
+    instr = (revise_instruction or "").strip()
+    if not instr:
+        return ("[ERROR] 請在『修改要求』填寫要怎麼改，例：刪除祖祠戲份／把第5拍拉長並加對白／"
+                "縮短宮宴那段／整體縮到10拍／加重某角色的戲份。", current_prompt)
+    if dry_run:
+        return ("[OK] Dry Run：未呼叫模型。正式模式會依你的要求修改手冊（保留格式與未受影響的拍）。", current_prompt)
+    try:
+        route = _make_route("Analysis / Grok", analysis_api_key, analysis_base_url, analysis_model_name)
+        revised = chat_complete(
+            route.client,
+            label="續寫 PROMPT 修改",
+            model=route.model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是小說『續寫導演手冊』的編輯。使用者會給你一份逐拍展開的續寫導演手冊"
+                        "（含 `### 第 N 拍：` 區塊與子標）和一條修改要求。請**依要求修改這份手冊**："
+                        "可以刪除/新增整個節拍、拉長或縮短指定的拍、調整某個場景或某個角色的戲份比重、改變事件走向等。\n"
+                        "鐵則：\n"
+                        "1) 只改動受要求影響的部分，其餘拍與內容**保持原樣**，不要無故重寫。\n"
+                        "2) 若刪除或新增了拍，請把拍序**重新編號為連續**（第1拍、第2拍…）。\n"
+                        "3) 維持原本的格式與子標（場景與調度／事件推進／人物動機／對白方向／描寫技法套用／"
+                        "感官與句法節奏／銜接與避免重複／線索與章尾鉤子），以及開頭的『續寫總方向』與結尾的 Director 指令。\n"
+                        "4) 刪除某戲份時，順手調整相鄰拍的銜接，讓整體仍然連貫。\n"
+                        "5) 只輸出修改後的**完整**手冊，不要任何解說或前言。"
+                        f"{language_instruction(output_language)}"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"【修改要求】\n{instr}\n\n【目前的續寫導演手冊】\n{current}",
+                },
+            ],
+            temperature=0.4,
+            max_tokens=CONTINUATION_PLAN_MAX_TOKENS,
+        )
+        revised = (revised or "").strip()
+        if not revised:
+            return "[ERROR] 模型沒有回傳修改結果，請重試或調整要求。", current_prompt
+        return ("[OK] 已依要求修改續寫 PROMPT。可再下一條修改，或按『③b 套用編輯後的內容到寫作區』。", revised)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("revise_continuation_prompt failed")
+        return f"[ERROR] {exc}", current_prompt
+
+
 def _orchestrate_continuation(
     *,
     route: ModelRoute,

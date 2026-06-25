@@ -42,7 +42,7 @@ from story_skill_studio import distill_story_skill, orchestrate_story_prompt
 from story_skill_studio import load_latest_skill_to_agent_fields, load_orchestration_to_agent_fields
 from story_skill_studio import load_skill_techniques_to_agent_fields
 from story_skill_studio import read_continuation_source, generate_continuation_prompt
-from story_skill_studio import apply_edited_continuation_prompt
+from story_skill_studio import apply_edited_continuation_prompt, revise_continuation_prompt
 from story_skill_studio import render_technique_library, load_skill_dict
 from project_saves import delete_project_slot, load_project_slot, refresh_slots, save_project_slot
 from skill_technique_review import REVIEW_CHOICES, review_skill_and_technique
@@ -2264,6 +2264,13 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
                 interactive=True,
                 show_copy_button=True,
             )
+            with gr.Accordion("③a 依要求修改 PROMPT（AI 修訂：刪戲份／拉長／縮短指定拍）", open=True):
+                cont_revise_instruction = gr.Textbox(
+                    label="修改要求",
+                    placeholder="例：刪除祖祠戲份／把第5拍拉長並加入對白衝突／縮短宮宴那段／整體縮到10拍／加重某角色的戲份",
+                    lines=2,
+                )
+                cont_revise_btn = gr.Button("③a 依要求修改 PROMPT", variant="secondary")
             with gr.Row():
                 cont_prompt_apply_btn = gr.Button("③b 套用編輯後的內容到寫作區", variant="primary")
             cont_prompt_apply_status = gr.Textbox(label="Apply Status", lines=2, interactive=False)
@@ -2814,6 +2821,21 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
             cont_prompt_editor,
             avoid_words_input,
         ],
+        api_name=False,
+    )
+
+    cont_revise_btn.click(
+        revise_continuation_prompt,
+        inputs=[
+            cont_prompt_editor,
+            cont_revise_instruction,
+            cont_output_lang,
+            cont_prompt_dry_run,
+            analysis_api_key_input,
+            analysis_base_url_input,
+            analysis_model_input,
+        ],
+        outputs=[cont_prompt_status, cont_prompt_editor],
         api_name=False,
     )
 
