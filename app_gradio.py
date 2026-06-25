@@ -96,6 +96,13 @@ BOOK_WRITER_MAX_TOKENS = int(os.getenv("BOOK_WRITER_MAX_TOKENS", "100000"))
 BOOK_WRITER_DEFAULT_TOKENS = min(int(os.getenv("BOOK_WRITER_DEFAULT_TOKENS", "24000")), BOOK_WRITER_MAX_TOKENS)
 BOOK_WRITER_PLAN_MAX_TOKENS = int(os.getenv("BOOK_WRITER_PLAN_MAX_TOKENS", "2400"))
 BOOK_WRITER_REWRITE_MAX_TOKENS = int(os.getenv("BOOK_WRITER_REWRITE_MAX_TOKENS", "8000"))
+# Cross-reply continuity: before each generation, summarize the current story into a
+# compact "story state" (location/characters/just-happened/open tension/last beat)
+# and inject it as a hard continuity anchor. Costs one small extra LLM call per
+# generation; set BOOK_WRITER_CONTINUITY_STATE=0 to disable.
+BOOK_WRITER_CONTINUITY_STATE = os.getenv("BOOK_WRITER_CONTINUITY_STATE", "1").strip().lower() not in {"0", "false", "off", "no"}
+BOOK_WRITER_CONTINUITY_STATE_TOKENS = int(os.getenv("BOOK_WRITER_CONTINUITY_STATE_TOKENS", "500"))
+BOOK_WRITER_CONTINUITY_STATE_SOURCE_CHARS = int(os.getenv("BOOK_WRITER_CONTINUITY_STATE_SOURCE_CHARS", "6000"))
 DEFAULT_SYSTEM_PROMPT = """You are a senior long-form fiction writer and story director.
 Write immersive story prose based on the user's worldbuilding, memory, lorebook, style guidance, and direct instruction.
 
@@ -601,6 +608,45 @@ def build_reference_context(background, roles, lore, memory, style_dna, style_sa
     return "\n\n".join(section for section in sections if section.strip())
 
 
+def summarize_story_state(client, model_name, story, output_lang) -> str:
+    """Summarize the recent story into a compact, always-fresh continuity anchor.
+
+    Returns a short 'where we are now' state so each new generation picks up exactly
+    where the last one left off. Best-effort: returns "" on any failure or short story.
+    """
+    tail = trim_text(story or "", BOOK_WRITER_CONTINUITY_STATE_SOURCE_CHARS)
+    if len(tail.strip()) < 200:
+        return ""
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是小說連續性追蹤器。讀最近的故事內容，輸出一段極精簡的『目前狀態』，"
+                        "供下一段續寫無縫銜接。只描述已發生的現況，不要劇透或編造未發生的事，不要評論。"
+                        + infer_output_language(output_lang)
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "用 5-8 條極短句輸出目前狀態：地點/時間、在場人物、剛發生的關鍵事件、"
+                        "未解張力/懸念、主要角色當下的情緒與意圖、最後一個動作或畫面停在哪。\n\n"
+                        f"最近故事：\n{tail}"
+                    ),
+                },
+            ],
+            temperature=0.2,
+            max_tokens=BOOK_WRITER_CONTINUITY_STATE_TOKENS,
+        )
+        return get_message_content(response)
+    except Exception:  # noqa: BLE001 — continuity aid is best-effort, never block writing
+        logging.exception("summarize_story_state failed")
+        return ""
+
+
 def build_story_prompt(
     background,
     roles,
@@ -628,6 +674,7 @@ def build_story_prompt(
     context_length,
     extra_avoid_block: str = "",
     longform_memory: str = "",
+    story_state: str = "",
 ):
     director_note = build_director_note(custom_director)
     style_instruction = infer_style_instruction(style_name, custom_style)
@@ -654,10 +701,14 @@ def build_story_prompt(
         f"Style guidance: {style_instruction}",
         f"Optional directing texture (apply only when it does not conflict with the Story Instruction): {director_note}",
         "Sensory weights: " + ", ".join(f"{k}={v:.2f}" for k, v in sensory_values.items()),
-        "PRIMARY RULE: The Story Instruction in the user message is the single governing directive for this output. "
-        "Carry it out fully and concretely. Use the recent story context only for continuity. "
-        "Everything else — style presets, directing texture, sensory weights, the technique library, and imported JSON settings — "
-        "is low-priority and must yield whenever it conflicts with the Story Instruction.",
+        "PRIMARY RULE: The Story Instruction decides WHAT happens next. Carry it out fully and concretely, "
+        "but always ON THE EXISTING STORY'S TIMELINE — as a seamless continuation, never a fresh start. "
+        "Style presets, directing texture, sensory weights, the technique library, and imported JSON settings "
+        "are low-priority and must yield whenever they conflict with the Story Instruction.",
+        "CONTINUITY (HARD REQUIREMENT): 這是接續既有故事的續寫，連貫性是最高要求之一。必須與前文嚴格銜接——"
+        "沿用上一段的場景、在場人物、時間、地點、語氣與尚未完成的動作/情緒，從『接續錨點』的最後一句無縫往下寫；"
+        "保持人物性格、稱謂、已知事實與時間線一致；不要跳場、不要重啟故事、不要回頭重述或改寫已發生的內容。"
+        "若 Story Instruction 與當前場景銜接有落差，先用一兩句自然過渡，不要硬切。",
         "Treat imported JSON settings and the technique library as soft reference only. Never let them override the Story Instruction or the current scene.",
         "Length rule: write a substantial long-form continuation that uses the available token budget. Expand beats into scene prose instead of summarizing.",
         "Do not stop after the first beat; continue until the scene reaches a natural turn, reveal, or ending hook.",
@@ -677,6 +728,11 @@ def build_story_prompt(
         "=== STORY INSTRUCTION (PRIMARY — the continuation must carry this out) ===\n"
         + instruction_text
     )
+    # 1b) Current story state — an always-fresh, high-priority continuity anchor.
+    if story_state.strip():
+        user_parts.append(
+            "=== 目前劇情狀態（務必延續，不可矛盾）===\n" + story_state.strip()
+        )
     # 2) Continuity input.
     if longform_memory.strip():
         user_parts.append(
@@ -684,7 +740,13 @@ def build_story_prompt(
             "consistent; do NOT re-describe or contradict them):\n" + longform_memory.strip()
         )
     if recent_story:
-        user_parts.append(f"Recent Story Context (continuity only — continue naturally from here):\n{recent_story}")
+        user_parts.append(
+            "=== 上一段（接續錨點）===\n"
+            "以下是故事目前的最後內容。你必須**無縫承接它的最後一句**往下寫，延續同一場景、在場人物與"
+            "當下未完成的動作/情緒；不要跳場、不要重啟、不要回頭重述：\n"
+            + recent_story
+            + "\n（↑ 從上面最後一句直接往下續寫。）"
+        )
     # 3) Low-priority reference.
     if reference_context:
         user_parts.append(
@@ -1010,6 +1072,12 @@ def generate_continuation(
     )
     directive_cjk = output_lang != "English"
 
+    # Cross-reply continuity anchor: a fresh compact "story state" so this generation
+    # picks up exactly where the last one left off. One small extra call, best-effort.
+    story_state = ""
+    if BOOK_WRITER_CONTINUITY_STATE and (current_story or "").strip():
+        story_state = summarize_story_state(client, model_name, current_story, output_lang)
+
     def _run(extra_avoid_block: str):
         system_prompt, user_prompt, thought = build_story_prompt(
             background=background,
@@ -1044,6 +1112,7 @@ def generate_continuation(
             context_length=int(context_length),
             extra_avoid_block=extra_avoid_block,
             longform_memory=longform_memory,
+            story_state=story_state,
         )
         if system_prompt_override.strip():
             system_prompt = system_prompt_override.strip() + "\n\n" + system_prompt
@@ -1700,7 +1769,7 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
                         focus_words_input = gr.Textbox(label="Focus Words", placeholder="moonlight, sweat, static, rain...")
                         avoid_words_input = gr.Textbox(label="Avoid Words", placeholder="love, forever, destiny...")
                         custom_director_input = gr.Textbox(label="Director Note Override", placeholder="Override the random director note")
-                        context_length_slider = gr.Slider(500, 8000, value=3500, step=500, label="Context Window Hint")
+                        context_length_slider = gr.Slider(500, 12000, value=5000, step=500, label="Context Window Hint (recent chars kept verbatim for continuity)")
 
                 instruction = gr.Textbox(label="Story Instruction (Director)", lines=5, placeholder="What should happen next? 這條故事指令主導本次輸出。")
                 generate_btn = gr.Button("Generate Continuation", variant="primary")
