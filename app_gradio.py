@@ -43,6 +43,7 @@ from story_skill_studio import load_latest_skill_to_agent_fields, load_orchestra
 from story_skill_studio import load_skill_techniques_to_agent_fields
 from story_skill_studio import read_continuation_source, generate_continuation_prompt
 from story_skill_studio import apply_edited_continuation_prompt, revise_continuation_prompt
+from story_skill_studio import extend_continuation_prompt
 from story_skill_studio import render_technique_library, load_skill_dict
 from project_saves import delete_project_slot, load_project_slot, refresh_slots, save_project_slot
 from skill_technique_review import REVIEW_CHOICES, review_skill_and_technique
@@ -2271,6 +2272,10 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
                     lines=2,
                 )
                 cont_revise_btn = gr.Button("③a 依要求修改 PROMPT", variant="secondary")
+                gr.Markdown("要**真的加長/加拍**(例如從 25 拍延到 55 拍)請用下面這個——會逐拍真正展開,不會用「依此模式延展」帶過。")
+                with gr.Row():
+                    cont_extend_n = gr.Number(label="再新增幾拍", value=10, precision=0)
+                    cont_extend_btn = gr.Button("延展拍數（逐拍真正展開）", variant="secondary")
             with gr.Row():
                 cont_prompt_apply_btn = gr.Button("③b 套用編輯後的內容到寫作區", variant="primary")
             cont_prompt_apply_status = gr.Textbox(label="Apply Status", lines=2, interactive=False)
@@ -2829,6 +2834,21 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
         inputs=[
             cont_prompt_editor,
             cont_revise_instruction,
+            cont_output_lang,
+            cont_prompt_dry_run,
+            analysis_api_key_input,
+            analysis_base_url_input,
+            analysis_model_input,
+        ],
+        outputs=[cont_prompt_status, cont_prompt_editor],
+        api_name=False,
+    )
+
+    cont_extend_btn.click(
+        extend_continuation_prompt,
+        inputs=[
+            cont_prompt_editor,
+            cont_extend_n,
             cont_output_lang,
             cont_prompt_dry_run,
             analysis_api_key_input,

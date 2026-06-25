@@ -65,6 +65,20 @@ CONTINUATION_PLAN_MAX_TOKENS = int(os.getenv("BOOK_WRITER_CONTINUATION_PLAN_MAX_
 # single plan may request, to bound cost / number of calls.
 CONTINUATION_MAX_BEATS = max(1, int(os.getenv("BOOK_WRITER_CONTINUATION_MAX_BEATS", "60")))
 
+# Shared per-beat block format (use .replace("{i}", n)). One beat = one block.
+_CONT_BEAT_FORMAT = (
+    "只輸出『這一拍』的一個區塊，格式如下，每個子標都要具體展開成數行：\n"
+    "### 第 {i} 拍：[節拍功能]\n"
+    "- 場景與調度：時間、地點、在場人物、空間與道具\n"
+    "- 事件推進：具體發生什麼（2-3 個前後因果的動作/轉折，不是一句話）\n"
+    "- 人物動機與內心：每個在場角色此刻要什麼、怕什麼、潛台詞\n"
+    "- 對白方向：語氣、權力關係、要藏/要逼出什麼（給 1-2 句示範台詞）\n"
+    "- 描寫技法套用：逐一點名技法 → 在此處具體怎麼用 + 一句示範句\n"
+    "- 感官與句法節奏：主導感官、句長與停頓\n"
+    "- 銜接與避免重複：如何接上一段；本拍要避免的既有寫法、改用什麼新表達\n"
+    "- 推進/收束的線索與章尾鉤子"
+)
+
 DEFAULT_ORCHESTRATION_GOAL = (
     "根據蒸餾出的寫作技能與一個全新的故事種子，編排一個全新原創故事："
     "依技能的節拍模板排出章節，並為每個節拍標註要套用的描寫技法，"
@@ -770,7 +784,10 @@ def revise_continuation_prompt(
                         "3) 維持原本的格式與子標（場景與調度／事件推進／人物動機／對白方向／描寫技法套用／"
                         "感官與句法節奏／銜接與避免重複／線索與章尾鉤子），以及開頭的『續寫總方向』與結尾的 Director 指令。\n"
                         "4) 刪除某戲份時，順手調整相鄰拍的銜接，讓整體仍然連貫。\n"
-                        "5) 只輸出修改後的**完整**手冊，不要任何解說或前言。"
+                        "5) 只輸出修改後的**完整**手冊，不要任何解說或前言。\n"
+                        "6) **嚴禁偷懶省略**：不可用『依此類推』『第X至Y拍依此模式延展』『（略）』『以下省略』這類佔位句帶過；"
+                        "凡是你保留或修改的拍，都要寫出完整內容。若使用者要『大量新增/延展拍數』，"
+                        "請只在結尾用一句話提示『請改用「延展拍數」功能逐拍展開』，不要自己用省略佔位假裝延展。"
                         f"{language_instruction(output_language)}"
                     ),
                 },
@@ -789,6 +806,114 @@ def revise_continuation_prompt(
     except Exception as exc:  # noqa: BLE001
         logger.exception("revise_continuation_prompt failed")
         return f"[ERROR] {exc}", current_prompt
+
+
+def extend_continuation_prompt(
+    current_prompt: str,
+    add_beats: float | int | None,
+    output_language: str,
+    dry_run: bool,
+    analysis_api_key: str,
+    analysis_base_url: str,
+    analysis_model_name: str,
+) -> tuple[str, str]:
+    """Actually LENGTHEN the manual by N more beats — each new beat fully expanded in
+    its own parallel call (never a『依此模式延展』placeholder), appended to the manual.
+
+    Returns (status, extended_prompt)."""
+    current = (current_prompt or "").strip()
+    if not current:
+        return "[ERROR] 沒有可延展的續寫 PROMPT；請先按『③ 產出續寫 PROMPT』。", (current_prompt or "")
+    add = to_positive_int(add_beats) or 0
+    if add <= 0:
+        return "[ERROR] 請填『再新增幾拍』（大於 0）。", current
+    nums = [int(x) for x in re.findall(r"###\s*第\s*(\d+)\s*拍", current)]
+    count = max(nums) if nums else 0
+    start = count + 1
+    end = min(count + add, CONTINUATION_MAX_BEATS)
+    if start > end:
+        return f"[ERROR] 已達上限 {CONTINUATION_MAX_BEATS} 拍，無法再延展（目前 {count} 拍）。", current
+    if dry_run:
+        return (f"[OK] Dry Run：未呼叫模型。正式模式會逐拍展開第 {start}-{end} 拍（每拍各一次呼叫），接到現有手冊。", current)
+    try:
+        route = _make_route("Analysis / Grok", analysis_api_key, analysis_base_url, analysis_model_name)
+        lang = language_instruction(output_language)
+        first_beat_pos = current.find("### 第")
+        direction = current[:first_beat_pos].strip() if first_beat_pos != -1 else ""
+        blocks = [b for b in re.split(r"(?=###\s*第\s*\d+\s*拍)", current) if b.strip().startswith("###")]
+        last_beat = blocks[-1].strip()[:1500] if blocks else ""
+
+        skeleton_raw = chat_complete(
+            route.client,
+            label=f"延展骨架 {start}-{end}",
+            model=route.model_name,
+            messages=[
+                {"role": "system", "content": "你是小說續寫劇情編排總監。延續一份既有的續寫手冊，規劃『接下來新增的拍』的一句話骨架，逐步推進、不重複前面、不重啟。" + lang},
+                {"role": "user", "content": (
+                    f"已有 {count} 拍。\n【整體方向】\n{direction or '（見既有拍）'}\n\n"
+                    f"【最後一拍（要從這之後接）】\n{last_beat or '（無）'}\n\n"
+                    f"請規劃第 {start} 到 {end} 拍的一句話骨架，每拍一行，格式『第N拍：[節拍功能] 一句話事件』，"
+                    f"務必剛好 {end - start + 1} 行，不可合併、不可寫成範圍。"
+                )},
+            ],
+            temperature=0.5,
+            max_tokens=min(CONTINUATION_PLAN_MAX_TOKENS, max(1200, (end - start + 1) * 80)),
+        )
+        _, oneliners = _split_continuation_skeleton(skeleton_raw, end)
+        new_skeleton = "\n".join(f"第{i}拍：{oneliners.get(i, '（待定）')}" for i in range(start, end + 1))
+        beat_system = (
+            "你是小說續寫導演。只把『指定的單一節拍』展開成詳細導演手冊區塊，比照手冊既有拍的格式與技法運用方式。\n"
+            "1) 只寫被指定那一拍，輸出剛好一個 `### 第 N 拍：` 區塊；嚴禁寫到別拍、嚴禁合併、嚴禁範圍標題、嚴禁用『依此類推』。\n"
+            "2) 延續既有人物、世界、語氣與未解線索，不重啟、不重述已寫內容。"
+            f"{lang}"
+        )
+
+        def _expand(i: int) -> tuple[int, str]:
+            user = (
+                f"延展手冊：整體將有 {end} 拍，請只展開『第 {i} 拍』。\n\n"
+                f"【本拍骨架】\n第{i}拍：{oneliners.get(i, '（依脈絡判斷本拍功能）')}\n\n"
+                f"【整體方向】\n{direction or '（見既有拍）'}\n\n"
+                f"【新增拍骨架（前後脈絡，勿展開別拍）】\n{new_skeleton}\n\n"
+                + (f"【上一拍（要無縫接上）】\n{last_beat}\n\n" if i == start else "")
+                + _CONT_BEAT_FORMAT.replace("{i}", str(i))
+            )
+            try:
+                text = chat_complete(
+                    route.client, label=f"延展第{i}拍", model=route.model_name,
+                    messages=[{"role": "system", "content": beat_system}, {"role": "user", "content": user}],
+                    temperature=0.6, max_tokens=CONTINUATION_PLAN_MAX_TOKENS,
+                ).strip()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("extend beat %d failed: %s", i, exc)
+                text = f"### 第 {i} 拍：（產生失敗：{exc}）"
+            if not re.search(r"###\s*第", text):
+                text = f"### 第 {i} 拍\n{text}"
+            return i, text
+
+        results: dict[int, str] = {}
+        with ThreadPoolExecutor(max_workers=SPECIALIST_MAX_WORKERS) as executor:
+            futures = [executor.submit(_expand, i) for i in range(start, end + 1)]
+            for future in as_completed(futures):
+                i, text = future.result()
+                results[i] = text
+        new_beats = "\n\n".join(results[i] for i in range(start, end + 1) if i in results)
+
+        # Insert new beats before the trailing 線索/Director footer if present, else append.
+        marker = None
+        for m in ("## 整體要推進/收束的未解線索", "## 給寫作 AI 的最終 Director 指令"):
+            if m in current:
+                marker = m
+                break
+        if marker:
+            idx = current.find(marker)
+            combined = (current[:idx].rstrip() + "\n\n" + new_beats + "\n\n" + current[idx:].strip()).strip()
+        else:
+            combined = (current.rstrip() + "\n\n" + new_beats).strip()
+        return (f"[OK] 已延展 {end - start + 1} 拍（第 {start}-{end} 拍），逐拍真正展開並接上現有手冊。"
+                "可再延展、用『③a 依要求修改』微調，或按『③b 套用』。", combined)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("extend_continuation_prompt failed")
+        return f"[ERROR] {exc}", current
 
 
 def _orchestrate_continuation(
@@ -845,18 +970,7 @@ def _orchestrate_continuation(
     direction_block, beat_oneliners = _split_continuation_skeleton(skeleton_raw, n)
     full_skeleton = "\n".join(f"第{i}拍：{beat_oneliners.get(i, '（待定）')}" for i in range(1, n + 1))
 
-    beat_format = (
-        "只輸出『這一拍』的一個區塊，格式如下，每個子標都要具體展開成數行：\n"
-        "### 第 {i} 拍：[節拍功能]\n"
-        "- 場景與調度：時間、地點、在場人物、空間與道具\n"
-        "- 事件推進：具體發生什麼（2-3 個前後因果的動作/轉折，不是一句話）\n"
-        "- 人物動機與內心：每個在場角色此刻要什麼、怕什麼、潛台詞\n"
-        "- 對白方向：語氣、權力關係、要藏/要逼出什麼（給 1-2 句示範台詞）\n"
-        "- 描寫技法套用：逐一點名技法 → 在此處具體怎麼用 + 一句示範句\n"
-        "- 感官與句法節奏：主導感官、句長與停頓\n"
-        "- 銜接與避免重複：如何接上一段；本拍要避免的既有寫法、改用什麼新表達\n"
-        "- 推進/收束的線索與章尾鉤子"
-    )
+    beat_format = _CONT_BEAT_FORMAT
     beat_system = (
         "你是小說續寫導演。你只負責把『指定的單一節拍』展開成詳細到可直接照寫的導演手冊區塊。鐵則：\n"
         "1) 只寫被指定的那一拍，輸出剛好一個 `### 第 N 拍：` 區塊；嚴禁寫到別拍、嚴禁合併多拍、嚴禁寫成範圍標題。\n"
