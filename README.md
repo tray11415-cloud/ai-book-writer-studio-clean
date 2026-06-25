@@ -112,7 +112,8 @@ The studio is organized as a single top-to-bottom pipeline. The tab order **is**
 9. `9. 技法回灌與檢閱 Skill / Technique Review` — distill `full_report.md` into a compact `Technique Library`, and review the latest deep outputs locally.
 11. `11. 故事技能 Story Skill` — distill an input novel into a reusable, **plot-bound** writing skill, orchestrate an original technique-bound prompt from it, and load it straight into Interactive Writing (see [Story Skill](#story-skill-distill--orchestrate--write)).
 12. `12. 續寫 Continuation` — continue *your own* novel: pick a distilled skill, load the to-be-continued novel (reads its real characters/world/plot/where-it-left-off), and generate a continuation prompt that reuses the skill's technique binding, continuation-aware plot orchestration, and the repetition guard (see [Continuation tab](#continuation-tab)).
-13. `13. 說明書 Manual` — the full panel guide rendered in-app.
+13. `13. 劇情連貫改寫 Continuity Rewrite` — goal-driven rewrite of a passage that stays plot-coherent: it locates the passage in the Full Story, uses the surrounding text as before/after context, optionally applies a distilled skill's techniques + the repetition guard, and can replace the original passage in place. (Distinct from `4. 改寫`, which is style transfer.)
+14. `14. 說明書 Manual` — the full panel guide rendered in-app.
 
 ## Model routing
 

@@ -43,6 +43,7 @@ from story_skill_studio import load_latest_skill_to_agent_fields, load_orchestra
 from story_skill_studio import load_skill_techniques_to_agent_fields
 from story_skill_studio import read_continuation_source, generate_continuation_prompt
 from story_skill_studio import apply_edited_continuation_prompt
+from story_skill_studio import render_technique_library, load_skill_dict
 from project_saves import delete_project_slot, load_project_slot, refresh_slots, save_project_slot
 from skill_technique_review import REVIEW_CHOICES, review_skill_and_technique
 from technique_library_builder import ALL_CATEGORY_CHOICES, BOOK_LIBRARY_LOAD_MODES
@@ -103,6 +104,8 @@ BOOK_WRITER_REWRITE_MAX_TOKENS = int(os.getenv("BOOK_WRITER_REWRITE_MAX_TOKENS",
 BOOK_WRITER_CONTINUITY_STATE = os.getenv("BOOK_WRITER_CONTINUITY_STATE", "1").strip().lower() not in {"0", "false", "off", "no"}
 BOOK_WRITER_CONTINUITY_STATE_TOKENS = int(os.getenv("BOOK_WRITER_CONTINUITY_STATE_TOKENS", "500"))
 BOOK_WRITER_CONTINUITY_STATE_SOURCE_CHARS = int(os.getenv("BOOK_WRITER_CONTINUITY_STATE_SOURCE_CHARS", "6000"))
+# Continuity-Aware Rewrite: how many chars of surrounding story to use as before/after context.
+BOOK_WRITER_REWRITE_CONTEXT_CHARS = int(os.getenv("BOOK_WRITER_REWRITE_CONTEXT_CHARS", "3000"))
 DEFAULT_SYSTEM_PROMPT = """You are a senior long-form fiction writer and story director.
 Write immersive story prose based on the user's worldbuilding, memory, lorebook, style guidance, and direct instruction.
 
@@ -645,6 +648,117 @@ def summarize_story_state(client, model_name, story, output_lang) -> str:
     except Exception:  # noqa: BLE001 — continuity aid is best-effort, never block writing
         logging.exception("summarize_story_state failed")
         return ""
+
+
+def _rewrite_context_from_story(full_story, passage, manual_before, manual_after):
+    """Find the passage inside Full Story and grab surrounding context for continuity.
+
+    Falls back to the story tail as general context if the passage isn't found.
+    Returns (before, after, found)."""
+    story = full_story or ""
+    p = (passage or "").strip()
+    auto_before = auto_after = ""
+    found = bool(p and p in story)
+    if found:
+        idx = story.find(p)
+        auto_before = story[:idx][-BOOK_WRITER_REWRITE_CONTEXT_CHARS:]
+        auto_after = story[idx + len(p):][:BOOK_WRITER_REWRITE_CONTEXT_CHARS]
+    elif story.strip():
+        auto_before = trim_text(story, BOOK_WRITER_REWRITE_CONTEXT_CHARS)
+    before = (manual_before or "").strip() or auto_before
+    after = (manual_after or "").strip() or auto_after
+    return before, after, found
+
+
+def continuity_rewrite(
+    passage,
+    goal,
+    full_story,
+    before_text,
+    after_text,
+    skill_json,
+    skill_file,
+    target_length,
+    output_lang,
+    dry_run,
+    api_key,
+    base_url,
+    model_name,
+):
+    """Rewrite a passage toward a goal while staying plot-coherent with the story.
+
+    Uses the surrounding Full Story context (or pasted before/after), optional skill
+    techniques, and the repetition guard. Returns (status, rewritten_passage)."""
+    passage = (passage or "").strip()
+    if not passage:
+        return "[ERROR] 請貼上要改寫的段落。", ""
+    goal = (goal or "").strip() or "在不偏離劇情的前提下，讓這段更精煉、更有張力、更有畫面感。"
+    before, after, found = _rewrite_context_from_story(full_story, passage, before_text, after_text)
+    ctx_note = (
+        f"（已在 Full Story 找到原段落，取前/後文 {len(before)}/{len(after)} 字保持連貫）"
+        if found else "（未在 Full Story 找到原段落；以故事內容為一般上下文）"
+    )
+    skill = load_skill_dict(skill_json, skill_file)
+    technique_block = render_technique_library(skill)
+    overused = rg.extract_overused_phrases(full_story or "") if rg.GUARD_ENABLED else []
+    avoid = ("、".join(overused[:15]) if output_lang != "English" else ", ".join(overused[:15])) if overused else ""
+    try:
+        tlen = int(target_length)
+    except (TypeError, ValueError):
+        tlen = 0
+
+    if dry_run:
+        return ("[OK] Dry Run：未呼叫模型。" + ctx_note,
+                "（Dry Run 範例）此處會輸出一段改寫後、與前後文劇情連貫、達成目標的完整段落。")
+
+    try:
+        client = get_client(api_key, base_url)
+        system_prompt = (
+            "你是小說改寫編輯，專精『劇情連貫的段落改寫』。把使用者指定的段落改寫成一段**完整、通順**的新段落，"
+            "達成其改寫目標，同時**與前後文嚴格連貫**：沿用既有人物、稱謂、時間線與設定，從前文自然接入、能順接到後文，"
+            "不製造矛盾、不重啟、不重述前文已寫的內容。只輸出改寫後的段落本身，不要任何解說或標題。"
+            + infer_output_language(output_lang)
+        )
+        parts = [f"【改寫目標】\n{goal}"]
+        if before:
+            parts.append(f"【前文（你的開頭要能自然接上這裡）】\n{before}")
+        parts.append(f"【要改寫的段落】\n{passage}")
+        if after:
+            parts.append(f"【後文（你的結尾要能順接到這裡）】\n{after}")
+        if technique_block:
+            parts.append(f"【可選用的描寫技法（來自蒸餾技能）】\n{technique_block}")
+        if avoid:
+            parts.append(f"【避免重複的既有措辞】\n{avoid}")
+        if tlen > 0:
+            parts.append(f"【目標長度】約 {tlen} 字")
+        parts.append("請只輸出改寫後的完整段落。")
+        max_out = min(max((tlen * 2) if tlen else 2000, 800), BOOK_WRITER_REWRITE_MAX_TOKENS)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "\n\n".join(parts)},
+            ],
+            temperature=0.8,
+            max_tokens=max_out,
+        )
+        return "[OK] 改寫完成。" + ctx_note + "\n→ 可在下方編輯，或按『取代 Full Story 原段落』套回。", get_message_content(response)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("continuity_rewrite failed")
+        return f"[ERROR] {exc}", ""
+
+
+def apply_rewrite_to_full_story(full_story, original_passage, rewritten):
+    """Replace the original passage in Full Story with the rewrite (or append if not found)."""
+    story = full_story or ""
+    orig = (original_passage or "").strip()
+    new = (rewritten or "").strip()
+    if not new:
+        return story, "[ERROR] 沒有改寫結果可套用。"
+    if orig and orig in story:
+        return story.replace(orig, new, 1), "[OK] 已用改寫結果取代 Full Story 中的原段落。"
+    combined = (story.rstrip() + "\n\n" + new).strip() if story.strip() else new
+    return combined, "[提醒] 在 Full Story 找不到原段落（可能已被編輯）；已將改寫結果附加到結尾，請自行確認位置。"
 
 
 def build_story_prompt(
@@ -2123,7 +2237,31 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
             with gr.Accordion("格式化預覽 Rendered Preview（唯讀）", open=False):
                 cont_prompt_preview = gr.Markdown()
 
-    with gr.Tab("13. 說明書 Manual"):
+    with gr.Tab("13. 劇情連貫改寫 Continuity Rewrite"):
+        gr.Markdown(
+            "### 目標導向 + 劇情連貫的段落改寫\n"
+            "貼上**要改寫的段落**與**改寫目標**，系統會自動用『3. 寫作』的 Full Story 當上下文"
+            "（在全文裡找到該段，取其前後文）保持劇情連貫，輸出一段**完整段落**。可選用蒸餾技能的技法、"
+            "並避免重複既有措辞。與『4. 改寫』不同：那個是風格轉換，這個是**目標 + 劇情連貫**。"
+        )
+        crw_passage = gr.Textbox(label="要改寫的段落", lines=8, placeholder="貼上 Full Story 裡要改寫的那一段（最好原文照貼，系統才能定位前後文）。")
+        crw_goal = gr.Textbox(label="改寫目標", lines=3, placeholder="例：讓這段更緊張；把內心獨白改成對話衝突；加入感官細節；讓它自然銜接到下一場…")
+        with gr.Accordion("上下文（預設自動用 Full Story；要手動指定才填）", open=False):
+            crw_before = gr.Textbox(label="前文（可選，留空＝自動取）", lines=4)
+            crw_after = gr.Textbox(label="後文（可選，留空＝自動取）", lines=4)
+            crw_skill_file = gr.File(label="（可選）套用技能 story_skill.json（留空＝用故事技能分頁蒸餾的）", file_count="single", file_types=[".json"])
+        with gr.Row():
+            crw_target_len = gr.Number(label="目標長度（字，0＝自動）", value=0, precision=0)
+            crw_lang = gr.Dropdown(["繁體中文", "简体中文", "English", "日本語"], value="繁體中文", label="Output Language")
+            crw_dry_run = gr.Checkbox(label="Dry Run", value=True)
+        crw_btn = gr.Button("改寫（劇情連貫）", variant="primary")
+        crw_status = gr.Textbox(label="Status", lines=3, interactive=False)
+        crw_result = gr.Textbox(label="改寫結果（可手動編輯）", lines=12, interactive=True, show_copy_button=True)
+        with gr.Row():
+            crw_apply_btn = gr.Button("用改寫結果取代 Full Story 原段落", variant="secondary")
+        crw_apply_status = gr.Textbox(label="Apply Status", lines=2, interactive=False)
+
+    with gr.Tab("14. 說明書 Manual"):
         gr.Markdown(
             "### 使用說明書 — 逐面板說明、深度分析原理與操作流程\n\n"
             "下面是完整說明書（與專案根目錄的 "
@@ -2649,6 +2787,34 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
         apply_edited_continuation_prompt,
         inputs=[cont_prompt_editor],
         outputs=[instruction, cont_prompt_apply_status],
+        api_name=False,
+    )
+
+    crw_btn.click(
+        continuity_rewrite,
+        inputs=[
+            crw_passage,
+            crw_goal,
+            full_story_box,
+            crw_before,
+            crw_after,
+            skill_json_state,
+            crw_skill_file,
+            crw_target_len,
+            crw_lang,
+            crw_dry_run,
+            api_key_input,
+            base_url_input,
+            model_name_input,
+        ],
+        outputs=[crw_status, crw_result],
+        api_name=False,
+    )
+
+    crw_apply_btn.click(
+        apply_rewrite_to_full_story,
+        inputs=[full_story_box, crw_passage, crw_result],
+        outputs=[full_story_box, crw_apply_status],
         api_name=False,
     )
 

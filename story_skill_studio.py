@@ -472,6 +472,16 @@ def _skill_for_prompt(skill: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def load_skill_dict(skill_json_str: str, skill_file: Any) -> dict[str, Any]:
+    """Public: load a skill dict from JSON text or an uploaded file; {} if none/failure."""
+    try:
+        if (skill_json_str or "").strip() or skill_file:
+            return _load_skill_payload(skill_json_str, skill_file)
+    except Exception:  # noqa: BLE001
+        logger.warning("load_skill_dict: failed to load skill, ignoring")
+    return {}
+
+
 def _load_skill_payload(skill_json_str: str, skill_file: Any) -> dict[str, Any]:
     text = (skill_json_str or "").strip()
     if not text and skill_file:
