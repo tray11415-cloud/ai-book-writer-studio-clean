@@ -1,0 +1,12 @@
+# ---------------------------------------------------------------------------
+# Legacy AutoGen multi-agent book generator (main.py / agents.py /
+# book_generator.py / outline_generator.py).
+#
+# This is OPTIONAL and separate from requirements.txt because `autogen` does
+# not support Python 3.14. Install it on a Python 3.10-3.13 environment:
+#     pip install -r requirements.txt
+#     pip install -r requirements-legacy.txt
+#
+# The Gradio studio (app_gradio.py / BUILD.BAT) does NOT need this file.
+# ---------------------------------------------------------------------------
+autogen>=0.2.0

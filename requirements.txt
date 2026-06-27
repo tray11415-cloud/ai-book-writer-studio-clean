@@ -2,8 +2,12 @@
 # Runtime dependencies (required to run the studio and the legacy pipeline)
 # ---------------------------------------------------------------------------
 
-# Legacy AutoGen multi-agent book generator (main.py / agents.py / book_generator.py).
-autogen>=0.2.0
+# NOTE: the legacy AutoGen multi-agent generator (main.py / agents.py /
+# book_generator.py) is NOT installed here, because `autogen` does not yet
+# support Python 3.14 and would abort the whole install. The Gradio studio does
+# not need it. If you specifically want the legacy pipeline, run:
+#     pip install -r requirements-legacy.txt
+# on a Python 3.10-3.13 environment.
 
 # OpenAI-compatible client used by the studio, web chat, and compat proxy.
 openai>=1.30.0
