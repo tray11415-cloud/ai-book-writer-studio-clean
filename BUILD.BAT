@@ -30,7 +30,18 @@ if not defined PYLAUNCHER (
     goto :error
 )
 
-REM --- Create the virtual environment if missing --------------------------
+REM --- Validate any existing venv; recreate it if broken ------------------
+REM A venv built by a Python that was later uninstalled/moved leaves a
+REM python.exe that cannot run ("did not find executable"). Detect that and
+REM rebuild from scratch instead of failing.
+if exist "%VENV_PYTHON%" (
+    "%VENV_PYTHON%" --version >nul 2>nul
+    if errorlevel 1 (
+        echo [1/4] Existing virtual environment is broken. Rebuilding it...
+        rmdir /s /q "%VENV_DIR%"
+    )
+)
+
 if not exist "%VENV_PYTHON%" (
     echo [1/4] Creating virtual environment...
     %PYLAUNCHER% -m venv "%VENV_DIR%"
