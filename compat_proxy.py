@@ -216,7 +216,21 @@ class CompatProxyHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as exc:
             self._send_json({"error": f"Invalid request JSON: {exc}"}, status=400)
         except requests.HTTPError as exc:
-            detail = exc.response.text if exc.response is not None else str(exc)
+            resp = exc.response
+            code = resp.status_code if resp is not None else "?"
+            body = (resp.text if resp is not None else "").strip()
+            if not body:
+                # An empty error body is almost always an auth failure: the
+                # upstream rejected the request before producing any content.
+                if resp is not None and code in (401, 403):
+                    body = (
+                        "authentication failed (HTTP %s) - check that "
+                        "OPENAI_API_KEY in your .env is your real NALANG key, "
+                        "not the placeholder from .env.example" % code
+                    )
+                else:
+                    body = "upstream returned HTTP %s with an empty body" % code
+            detail = "Upstream error (HTTP %s): %s" % (code, body)
             self._send_json({"error": detail}, status=502)
         except (requests.Timeout, requests.ConnectionError) as exc:
             self._send_json(
