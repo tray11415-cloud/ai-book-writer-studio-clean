@@ -90,3 +90,35 @@ def test_discover_dry_run_from_seed_url(tmp_path: Path) -> None:
     assert report_path is not None and Path(report_path).is_file()
     parsed = json.loads(skill_json)
     assert parsed["source_policy"]["stored_full_text"] is False
+
+
+def test_discover_dry_run_falls_back_without_candidates(tmp_path: Path) -> None:
+    old_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        status, preview, skill_path, report_path, skill_json = discover_and_distill_web_skill(
+            target_description="仙俠慢熱、壓迫感、段尾鉤子",
+            target_excerpt="他停在門外。風很冷。",
+            seed_urls_text="",
+            source_modes=["Seed URLs only"],
+            allowed_domains_text="",
+            distill_goal="找缺失技法並蒸餾成 skill",
+            output_language="繁體中文",
+            max_search_results=1,
+            max_pages_to_fetch=1,
+            max_snippet_chars=800,
+            dry_run=True,
+            analysis_api_key="",
+            analysis_base_url="",
+            analysis_model_name="",
+        )
+    finally:
+        os.chdir(old_cwd)
+
+    assert status.startswith("[OK]")
+    assert "候選來源：0" in status
+    assert "No external candidate pages were found" in preview
+    assert skill_path is not None and Path(skill_path).is_file()
+    assert report_path is not None and Path(report_path).is_file()
+    parsed = json.loads(skill_json)
+    assert parsed["gap_analysis"]["missing_techniques"]

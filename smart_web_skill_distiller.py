@@ -163,17 +163,22 @@ def discover_and_distill_web_skill(
             allowed_domains=allowed_domains,
             max_results=max_results,
         )
-        if not candidates:
+        if candidates:
+            evidence, compliance_notes = collect_public_evidence(
+                session=session,
+                candidates=candidates,
+                target_description=description,
+                target_excerpt=excerpt,
+                max_pages=max_pages,
+                max_snippet_chars=snippet_chars,
+            )
+        elif description or excerpt:
+            evidence = []
+            compliance_notes = [
+                "No external candidate pages were found; generated a local gap skill from the target description/excerpt only.",
+            ]
+        else:
             return "[ERROR] 找不到候選來源。可貼幾個公開章節 URL，或放寬 Allowed Domains。", "", None, None, ""
-
-        evidence, compliance_notes = collect_public_evidence(
-            session=session,
-            candidates=candidates,
-            target_description=description,
-            target_excerpt=excerpt,
-            max_pages=max_pages,
-            max_snippet_chars=snippet_chars,
-        )
 
         if dry_run:
             skill = build_local_gap_skill(description, excerpt, evidence)
