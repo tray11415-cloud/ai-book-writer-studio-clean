@@ -45,6 +45,8 @@ from story_skill_studio import read_continuation_source, generate_continuation_p
 from story_skill_studio import apply_edited_continuation_prompt, revise_continuation_prompt
 from story_skill_studio import extend_continuation_prompt
 from story_skill_studio import render_technique_library, load_skill_dict
+from smart_web_skill_distiller import DEFAULT_WEB_SKILL_GOAL, WEB_SOURCE_MODE_CHOICES
+from smart_web_skill_distiller import discover_and_distill_web_skill
 from project_saves import delete_project_slot, load_project_slot, refresh_slots, save_project_slot
 from skill_technique_review import REVIEW_CHOICES, review_skill_and_technique
 from technique_library_builder import ALL_CATEGORY_CHOICES, BOOK_LIBRARY_LOAD_MODES
@@ -2184,6 +2186,56 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
         skill_tech_state = gr.State("")
         skill_beat_state = gr.State("")
 
+        with gr.Accordion("Step 0 ｜ 智慧網路技巧探索 Smart Web Skill Scout", open=False):
+            gr.Markdown(
+                "輸入目標類型或片段後，系統會從公開網頁短摘錄抽取缺失技法，並蒸餾成可直接沿用的 `story_skill.json`。"
+                "Pixiv 來源只走公開搜尋/公開頁面；若 robots.txt、登入或平台限制不允許，會略過而不繞過。"
+            )
+            with gr.Row():
+                with gr.Column(scale=3):
+                    web_skill_target_description = gr.Textbox(
+                        label="目標小說類型 / 讀者效果",
+                        lines=4,
+                        placeholder="例：仙俠師徒、壓迫感、含蓄曖昧、慢熱但每段都有推進...",
+                    )
+                    web_skill_target_excerpt = gr.Textbox(
+                        label="我的小說片段（用來找缺口，可選）",
+                        lines=8,
+                        placeholder="貼上目前片段，系統會診斷缺少哪些技巧。",
+                    )
+                    web_skill_seed_urls = gr.Textbox(
+                        label="種子 URL（每行一個，可選）",
+                        lines=4,
+                        placeholder="https://example.com/chapter.html",
+                    )
+                    web_skill_goal = gr.Textbox(label="/goal", value=DEFAULT_WEB_SKILL_GOAL, lines=3)
+                with gr.Column(scale=2):
+                    web_skill_modes = gr.CheckboxGroup(
+                        WEB_SOURCE_MODE_CHOICES,
+                        value=["Seed URLs only", "Search public web", "Search Pixiv via public search"],
+                        label="Source Modes",
+                    )
+                    web_skill_allowed_domains = gr.Textbox(
+                        label="Allowed Domains（可選；空白＝不限制）",
+                        placeholder="pixiv.net example.com",
+                    )
+                    web_skill_output_lang = gr.Dropdown(
+                        ["繁體中文", "简体中文", "English", "日本語"],
+                        value="繁體中文",
+                        label="Output Language",
+                    )
+                    with gr.Row():
+                        web_skill_max_results = gr.Number(label="Search Results", value=8, precision=0)
+                        web_skill_max_pages = gr.Number(label="Fetch Pages", value=5, precision=0)
+                    web_skill_snippet_chars = gr.Number(label="Max Snippet Chars / Source", value=1200, precision=0)
+                    web_skill_dry_run = gr.Checkbox(label="Dry Run / 離線蒸餾", value=True)
+            web_skill_btn = gr.Button("⓪ 探索缺口並蒸餾 Skill", variant="primary")
+            web_skill_status = gr.Textbox(label="Web Skill Status", lines=6, interactive=False)
+            web_skill_preview = gr.Markdown(label="Gap Report + Skill Preview")
+            with gr.Row():
+                web_skill_file_out = gr.File(label="story_skill.json")
+                web_skill_report_file = gr.File(label="gap_report.md")
+
         with gr.Accordion("Step 1 ｜ 蒸餾技能 Distill Skill（輸入參考小說）", open=True):
             with gr.Row():
                 with gr.Column(scale=3):
@@ -2683,6 +2735,34 @@ with gr.Blocks(title="AI Book Writer Studio") as demo:
             report_load_mode,
         ],
         outputs=[technique_library_input, memory_input, instruction, report_agent_load_status],
+        api_name=False,
+    )
+
+    web_skill_btn.click(
+        discover_and_distill_web_skill,
+        inputs=[
+            web_skill_target_description,
+            web_skill_target_excerpt,
+            web_skill_seed_urls,
+            web_skill_modes,
+            web_skill_allowed_domains,
+            web_skill_goal,
+            web_skill_output_lang,
+            web_skill_max_results,
+            web_skill_max_pages,
+            web_skill_snippet_chars,
+            web_skill_dry_run,
+            analysis_api_key_input,
+            analysis_base_url_input,
+            analysis_model_input,
+        ],
+        outputs=[
+            web_skill_status,
+            web_skill_preview,
+            web_skill_file_out,
+            web_skill_report_file,
+            skill_json_state,
+        ],
         api_name=False,
     )
 

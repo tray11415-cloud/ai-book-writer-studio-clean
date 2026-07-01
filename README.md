@@ -110,7 +110,7 @@ The studio is organized as a single top-to-bottom pipeline. The tab order **is**
 7. `7. 深度技法書庫 Deep Technique Book` — build a searchable hierarchy such as `容顏描寫 / 眼睛描寫`, `身材描寫 / 手與指節描寫`, `動作描寫 / 喝酒飲茶描寫` from the Reference Library, then load matched techniques into the writing AGENT.
 8. `8. 存讀檔 Save / Load` — **named multi-slot saves**: bundle the story bible, memory, technique library, prompts, **and the distilled Story Skill** into a named slot; keep many, load/delete any from a dropdown (see [Named save slots](#named-save-slots)). Single-file JSON export/import remains under an accordion.
 9. `9. 技法回灌與檢閱 Skill / Technique Review` — distill `full_report.md` into a compact `Technique Library`, and review the latest deep outputs locally.
-11. `11. 故事技能 Story Skill` — distill an input novel into a reusable, **plot-bound** writing skill, orchestrate an original technique-bound prompt from it, and load it straight into Interactive Writing (see [Story Skill](#story-skill-distill--orchestrate--write)).
+11. `11. 故事技能 Story Skill` — discover or distill reusable craft into a **principle + technique toolbox** skill, orchestrate an original technique-bound prompt from it, and load it straight into Interactive Writing (see [Story Skill](#story-skill-distill--orchestrate--write)).
 12. `12. 續寫 Continuation` — continue *your own* novel: pick a distilled skill, load the to-be-continued novel (reads its real characters/world/plot/where-it-left-off), and generate a continuation prompt that reuses the skill's technique binding, continuation-aware plot orchestration, and the repetition guard (see [Continuation tab](#continuation-tab)).
 13. `13. 劇情連貫改寫 Continuity Rewrite` — goal-driven rewrite of a passage that stays plot-coherent: it locates the passage in the Full Story, uses the surrounding text as before/after context, optionally applies a distilled skill's techniques + the repetition guard, and can replace the original passage in place. (Distinct from `4. 改寫`, which is style transfer.)
 14. `14. 說明書 Manual` — the full panel guide rendered in-app.
@@ -191,14 +191,22 @@ Export / Import accordion.
 
 ## Story Skill (distill → orchestrate → write)
 
-Tab `11. 故事技能 Story Skill` (module `story_skill_studio.py`) turns an input
-novel into a reusable **writing skill** that *deeply binds plot arrangement to
-description technique*, then writes an original story with it. The skill carries
-the source's **craft, never its content** — no source characters, places,
-objects, or concrete events — so the output is a fresh, original story, not a
-continuation of or a remix of the source's 人事物.
+Tab `11. 故事技能 Story Skill` turns a target description, excerpt, or reference
+novel into a reusable **writing skill**: narrative method, story-progression
+principles, plot-ideation heuristics, and a free-draw description-technique
+toolbox. The skill carries the source's **craft, never its content** — no source
+characters, places, objects, concrete events, or recognizable long passages.
 
-Three stages, each with a Dry-Run mode for offline checking:
+Four stages, each with a Dry-Run mode for offline checking where applicable:
+
+0. **Smart Web Skill Scout** (`smart_web_skill_distiller.py`) — enter a target
+   novel type / reader effect, optionally paste your own excerpt, and optionally
+   provide seed URLs. The scout can search public web results and Pixiv search
+   links, then only fetches pages that are public and allowed by `robots.txt`.
+   It does not log in, bypass paywalls, solve CAPTCHA, or store full novels; it
+   saves short evidence snippets plus an abstract gap report under
+   `book_output/web_skill_distillations/<timestamp>/`, and writes a compatible
+   `story_skill.json` directly into the Story Skill state.
 
 1. **Distill** (`distill_story_skill`) — feed a reference novel (TXT / pasted
    text / chapter-directory URL). The analysis model (Grok) returns a structured
@@ -206,18 +214,16 @@ Three stages, each with a Dry-Run mode for offline checking:
    - `narrative_method` — POV, tense, narration distance, voice, dialogue style.
    - `description_techniques[]` — technique cards (when-to-use, how, sentence
      rhythm, sensory layering, word palette, weak-vs-strong).
-   - `plot_arrangement` — engine, pacing curve, escalation, hook, arc shape
-     (abstract patterns only).
-   - `beat_template[]` — the **binding**: each beat names its `function`,
-     `pacing`, `emotional_target`, and the `bound_technique_ids` (which
-     description techniques to apply at that beat) plus how to apply them.
+   - `story_progression` — engine, pacing logic, escalation, hook, arc shape
+     (abstract principles only).
+   - `plot_ideation` — conflict sources, character engines, power dynamics,
+     seed planting, and stakes axes.
    The skill is saved to `book_output/story_skills/<timestamp>/story_skill.json`.
 
 2. **Orchestrate** (`orchestrate_story_prompt`) — skill-driven Plot Ideation.
    Give it a **new** story seed; it invents an original plot (all-new people /
-   places / events) following the skill's beat template, and composes a
-   high-quality, beat-by-beat **technique-bound writing prompt** where every
-   chapter says which techniques to apply. Saved under
+   places / events) following the skill's principles, and composes a high-quality
+   **technique-bound writing prompt**. Saved under
    `book_output/story_skills/orchestrations/<timestamp>/`.
 
 3. **Write** — the distill area (tab 11) and the writing area (tab 3) bind through
@@ -229,10 +235,10 @@ Three stages, each with a Dry-Run mode for offline checking:
    [repetition guard](#cross-response-repetition-guard).
 
    There are two ways to bind, plus the manual button:
-   - **Distill → write your own** (`①b 直接載入技法到寫作區`): right after Step 1,
-     load *only* the craft (narrative method + technique cards + beat→technique
-     mapping) — no invented plot. You drive the plot via `Story Instruction`, and
-     the model applies the bound techniques at the matching beat type.
+   - **Scout/Distill → write your own** (`①b 直接載入技法到寫作區`): right after
+     Step 0 or Step 1, load *only* the craft (narrative method + technique cards
+     + progression principles) — no invented plot. You drive the plot via
+     `Story Instruction`, and the model draws from the toolbox when relevant.
    - **Orchestrate → auto-load**: finishing Step 2 automatically loads the
      orchestrated, plot-bound prompt into the writing area (no manual click).
    - **Manual** (`③ 載入到寫作區` / `載入最近一次編排`): push the latest

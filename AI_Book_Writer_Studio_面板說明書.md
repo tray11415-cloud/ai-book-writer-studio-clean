@@ -19,7 +19,7 @@
 - **寫作**：NALANG + Local LoRA。
 - **分析**：Grok。
 - **劇情規劃**：Grok + NALANG + Local LoRA。
-- **深度技法書庫、Technique Finder、full_report 蒸餾**：主要使用 Grok；`Dry Run` 可本地測試不花 API。
+- **深度技法書庫、Technique Finder、full_report 蒸餾、Story Skill 網路探索**：主要使用 Grok；`Dry Run` 可本地測試不花 API。
 
 ---
 
@@ -30,7 +30,7 @@
 | ① 設定 | `1. 設定 Core Settings` | 設好寫作／分析／LoRA 模型，填世界觀、角色、記憶 |
 | ② 蒐集參考 | `2. 參考書架 Reference Library` | **隨時**上傳或刪除小說、報告當參考；全域共用 |
 | ③ 深度分析 | `5. 章節技法分析` ＋ `7. 深度技法書庫` | 把參考拆成「眼睛怎麼寫、喝酒怎麼寫」級別的技法卡 |
-| ④ 灌進寫作腦 | `7. 深度技法書庫` 搜尋載入 ／ `9. 技法回灌與檢閱` | 把技法卡載入寫作 AGENT 的 Technique Library |
+| ④ 灌進寫作腦 | `7. 深度技法書庫` 搜尋載入 ／ `9. 技法回灌與檢閱` ／ `11. 故事技能` | 把技法卡或 story skill 載入寫作 AGENT |
 | ⑤ 寫作 | `3. 寫作 Interactive Writing` | 用載入的技法生成續寫 |
 | ⑥ 打磨 | `4. 改寫`、`6. 劇情編排`、`9. 檢閱` | 改寫風格、編排劇情、檢閱技法品質 |
 
@@ -329,6 +329,35 @@
 
 ---
 
+## 11. 故事技能 Story Skill（智慧網路蒸餾 + 原則技能）
+
+這個分頁把參考來源蒸餾成 `story_skill.json`，內容是「敘事方式、故事推進原則、劇情發想思路、描寫技法工具箱」。它只保留怎麼寫，不保留來源的人名、地名、事件、設定或可辨識原文。
+
+### Step 0 ｜ 智慧網路技巧探索 Smart Web Skill Scout
+
+- `目標小說類型 / 讀者效果`：描述你想逼近的類型、氛圍與讀者感受。
+- `我的小說片段`：貼上目前片段，系統會找缺口，例如壓力源不足、感官太少、對話沒有潛台詞、段尾缺鉤子。
+- `種子 URL`：可貼公開章節或參考頁，每行一個。
+- `Source Modes`：可只讀種子 URL，也可做公開網頁搜尋與 Pixiv 公開搜尋連結探索。
+- `Allowed Domains`：需要限制來源時填網域，例如 `pixiv.net example.com`。
+- `Dry Run`：本地診斷，不呼叫 Grok；關掉後用 Analysis 模型正式蒸餾。
+
+合規規則：只抓公開 HTTP(S) 頁面，先檢查 `robots.txt`，不登入、不繞付費牆、不解 CAPTCHA；保存短摘錄索引與抽象技巧，不保存整篇小說。輸出在 `book_output/web_skill_distillations/<timestamp>/`，並會把新的 `story_skill.json` 直接放入 Story Skill 狀態。
+
+### Step 1 ｜ 蒸餾技能 Distill Skill
+
+上傳 TXT、貼參考小說正文，或給章節目錄 URL，蒸餾成同樣的 `story_skill.json`。正式模式使用 Analysis/Grok；Dry Run 可檢查流程。
+
+### Step 2 ｜ 編排劇情 + 產生提示詞
+
+輸入全新的故事種子，系統用目前 skill 編排原創劇情與技法綁定提示詞，輸出到 `book_output/story_skills/orchestrations/<timestamp>/`。完成後會自動載入寫作區。
+
+### Step 3 ｜ 載入寫作區
+
+`①b 直接載入技法到寫作區` 會只載入技法與原則，不編排新劇情；適合你自己主導情節。`③ 載入到寫作區` 則載入 Step 2 的提示詞、技法與推進原則。
+
+---
+
 ## 建議工作流（端到端）
 
 ### A. 多本小說彙整成可查詢的深度技法書庫
@@ -359,6 +388,13 @@
 1. 到 `6. 劇情編排`，填 `Story Seed / Premise`，可加入參考文本、Style DNA、Story Chronicle。
 2. 按 `Generate Plot Ideation`，把章節表或 Director Instruction 用於 `3. 寫作`。
 
+### E. 目標類型／片段 → 自動找缺口 → 蒸餾成 skill
+
+1. 到 `11. 故事技能` → `Step 0 智慧網路技巧探索`。
+2. 填目標類型或貼上自己的片段；可加公開 URL 或限制 Allowed Domains。
+3. 先用 `Dry Run` 看缺口報告；要更精細再關掉 Dry Run 用 Analysis 模型。
+4. 按 `①b 直接載入技法到寫作區`，或繼續 Step 2 編排新故事。
+
 ---
 
 ## 注意事項
@@ -366,6 +402,7 @@
 - 整本 TXT 沒有目錄時：在 `5. 章節技法分析` 把 `Chapter Limit` 設 `0`，用 `Max Chars / Chapter / Auto Chunk` 當自動切塊大小；`7. 深度技法書庫` 的單本蒸餾也用相同的無標題切塊。
 - `full_report.md` 不要直接貼進寫作 prompt，請先在 `9. 檢閱` 蒸餾成 `Technique Library`。
 - 多本小說要彙整成長期可查的技法書庫時，優先用 `2. 參考書架` ＋ `7. 深度技法書庫`，不要逐項手填。
+- Pixiv 或其他平台若 `robots.txt`、登入、付費牆或反自動化限制不允許讀取，`11. 故事技能` 的網路探索會略過，不會嘗試繞過限制。
 - `Technique Library` 是低優先級參考；最新的 `Director Instruction` 和當前故事上下文優先級更高。
 - `Dry Run` 不花 API；正式 Grok 分析才會呼叫 API，且深度欄位更貼合你的實際參考文本。
 - 主寫作 Studio 與獨立改寫工具是不同服務；不要把主寫作面板的 token 設定視為改寫工具設定。
